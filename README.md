@@ -42,7 +42,7 @@ GreyDNS enables development teams to manage their DNS records directly through K
 1. Deploy GreyDNS using kubectl:
 
     ```sh
-    kubectl apply -f https://raw.githubusercontent.com/math280h/greydns/main/deployment.yaml
+    kubectl apply -f https://raw.githubusercontent.com/math280h/greydns/refs/heads/main/deployment.yaml
     ```
 
 2. Create the required ConfigMap:
