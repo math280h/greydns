@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	ConfigMap *v1.ConfigMap
+	ConfigMap *v1.ConfigMap //nolint:gochecknoglobals // Required for configmap
 )
 
 func GetRequiredConfigValue(key string) string {
@@ -27,7 +27,9 @@ func LoadConfigMap(
 	clientset *kubernetes.Clientset,
 ) {
 	var err error
-	ConfigMap, err = clientset.CoreV1().ConfigMaps("default").Get(context.Background(), "greydns-config", metav1.GetOptions{})
+	ConfigMap, err = clientset.CoreV1().ConfigMaps(
+		"default",
+	).Get(context.Background(), "greydns-config", metav1.GetOptions{})
 	if err != nil {
 		log.Fatal().Err(err).Msg("[Config] Failed to get configmap")
 	}

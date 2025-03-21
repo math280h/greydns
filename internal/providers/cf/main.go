@@ -1,11 +1,11 @@
-package utils
+package providers
 
 import (
 	"context"
 	"errors"
-	"strings"
+	"regexp"
 
-	"github.com/cloudflare/cloudflare-go/v4"
+	cloudflare "github.com/cloudflare/cloudflare-go/v4"
 	"github.com/cloudflare/cloudflare-go/v4/dns"
 	"github.com/cloudflare/cloudflare-go/v4/option"
 	"github.com/cloudflare/cloudflare-go/v4/zones"
@@ -16,7 +16,8 @@ import (
 )
 
 var (
-	cloudflareAPI *cloudflare.Client
+	cloudflareAPI  *cloudflare.Client //nolint:gochecknoglobals // Required for cloudflare
+	commentPattern = regexp.MustCompile(`^\[greydns - Do not manually edit].*$`)
 )
 
 func Connect(
@@ -31,22 +32,24 @@ func CreateRecord(
 	name string,
 	ingressDestination string,
 	ttl int,
-	zoneId string,
+	zoneID string,
+	service *v1.Service,
 ) (*dns.RecordResponse, error) {
 	recordType := cfg.GetRequiredConfigValue("record-type")
 	proxied := cfg.GetRequiredConfigValue("proxy-enabled") == "true"
 
 	var record dns.RecordUnionParam
-	if recordType != "A" {
+	switch recordType {
+	case "A":
 		record = dns.ARecordParam{
 			Type:    cloudflare.F(dns.ARecordType("A")),
 			Name:    cloudflare.F(name),
 			Content: cloudflare.F(ingressDestination),
 			TTL:     cloudflare.F(dns.TTL(ttl)),
-			Comment: cloudflare.F("[greydns - Do not manually edit]"),
+			Comment: cloudflare.F("[greydns - Do not manually edit]" + service.Namespace + "/" + service.Name),
 			Proxied: cloudflare.F(proxied),
 		}
-	} else if recordType != "CNAME" {
+	case "CNAME":
 		record = dns.CNAMERecordParam{
 			Type:    cloudflare.F(dns.CNAMERecordType("CNAME")),
 			Name:    cloudflare.F(name),
@@ -55,24 +58,43 @@ func CreateRecord(
 			Comment: cloudflare.F("[greydns - Do not manually edit]"),
 			Proxied: cloudflare.F(proxied),
 		}
-	} else {
-		log.Error().Msgf("Invalid record type: %s", recordType)
+	default:
+		log.Error().Msgf("[CF Provider] Invalid record type: %s", recordType)
 		return nil, errors.New("invalid record type")
 	}
 	dnsRecord, err := cloudflareAPI.DNS.Records.New(
 		context.Background(),
 		dns.RecordNewParams{
-			ZoneID: cloudflare.F(zoneId),
+			ZoneID: cloudflare.F(zoneID),
 			Record: record,
 		},
 	)
 	if err != nil {
-		log.Error().Err(err).Msgf("[%s] Failed to create record", name)
+		log.Error().Err(err).Msgf("[CF Provider] [%s] Failed to create record", name)
 	} else {
-		log.Info().Msgf("[%s] Record created", name)
+		log.Info().Msgf("[CF Provider] [%s] Record created", name)
 	}
 
 	return dnsRecord, err
+}
+
+func DeleteRecord(
+	recordID string,
+	zoneID string,
+) error {
+	log.Info().Msgf("[CF Provider] Attempting to delete record %s", recordID)
+	_, err := cloudflareAPI.DNS.Records.Delete(
+		context.Background(),
+		recordID,
+		dns.RecordDeleteParams{
+			ZoneID: cloudflare.F(zoneID),
+		},
+	)
+	if err != nil {
+		log.Error().Err(err).Msgf("[CF Provider] Failed to delete record")
+	}
+
+	return err
 }
 
 func RefreshRecordsCache(zonesToNames map[string]string) map[string]dns.RecordResponse {
@@ -83,7 +105,7 @@ func RefreshRecordsCache(zonesToNames map[string]string) map[string]dns.RecordRe
 		})
 		for recordsIter.Next() {
 			record := recordsIter.Current()
-			if strings.Contains("[greydns - Do not manually edit]", record.Comment) {
+			if commentPattern.MatchString(record.Comment) {
 				newExistingRecords[record.Name] = record
 				log.Debug().Msgf("[CF Provider] Refresh Found record: %s (ID: %s)", record.Name, record.ID)
 			}
@@ -116,9 +138,9 @@ func CheckIfZoneExists(
 	zonesToNames map[string]string,
 	name string,
 ) (*zones.Zone, error) {
-	zoneId := zonesToNames[name]
+	zoneID := zonesToNames[name]
 	zone, err := cloudflareAPI.Zones.Get(context.Background(), zones.ZoneGetParams{
-		ZoneID: cloudflare.F(zoneId),
+		ZoneID: cloudflare.F(zoneID),
 	})
 	if err != nil {
 		log.Error().Err(err).Msg("[CF Provider] Failed to get zone")

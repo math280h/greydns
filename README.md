@@ -41,7 +41,9 @@ GreyDNS enables development teams to manage their DNS records directly through K
 
 1. Deploy GreyDNS using kubectl:
 
-    Coming soon...
+    ```sh
+    kubectl apply -f https://raw.githubusercontent.com/math280h/greydns/main/deployment.yaml
+    ```
 
 2. Create the required ConfigMap:
 
@@ -49,14 +51,14 @@ GreyDNS enables development teams to manage their DNS records directly through K
     apiVersion: v1
     kind: ConfigMap
     metadata:
-    name: greydns-config
-    namespace: default
+      name: greydns-config
+      namespace: default
     data:
-    record-ttl: "60"
-    record-type: "A"
-    cache-refresh-seconds: "60"
-    ingress-destination: "YOUR_INGRESS_IP"
-    proxy-enabled: "true"
+      record-ttl: "60"
+      record-type: "A"
+      cache-refresh-seconds: "60"
+      ingress-destination: "YOUR_INGRESS_IP"
+      proxy-enabled: "true"
     ```
 
 3. Create the CloudFlare API token secret:
@@ -82,6 +84,14 @@ metadata:
 spec:
   # ... rest of service spec
 ```
+
+### Duplicate Records
+
+GreyDNS will automatically deduplicate records based on the namespace and service name. If you create two records at the same time it's first come first serve.
+
+GreyDNS will create an event on the service if it detects a record that is already owned by another service.
+
+![Duplicate Record](assets/duplicate.png)
 
 ## 🔍 Configuration
 
