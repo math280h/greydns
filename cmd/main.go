@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cloudflare/cloudflare-go/v4/dns"
@@ -29,7 +30,7 @@ var (
 	existingRecords    = make(map[string]dns.RecordResponse) //nolint:gochecknoglobals // Required for existing records
 )
 
-func main() {
+func main() { //nolint:gocognit // Required for main function
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}) //nolint:reassign // Required for logging
 
 	// Create Kubernetes client
@@ -94,18 +95,40 @@ func main() {
 				service,
 			)
 		},
-		UpdateFunc: func(_, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj interface{}) {
 			service, ok := newObj.(*v1.Service)
 			if !ok {
 				log.Error().Msg("[Core] Failed to cast object during update")
 				return
 			}
-			records.HandleAnnotations(
-				existingRecords,
-				ingressDestination,
-				zonesToNames,
-				service,
-			)
+
+			oldService, ok := oldObj.(*v1.Service)
+			if !ok {
+				log.Error().Msg("[Core] Failed to cast old object during update")
+				return
+			}
+
+			annotationsChanged := false
+			for key, value := range service.Annotations {
+				if !strings.Contains(key, "greydns.io") {
+					continue
+				}
+				if value != oldService.Annotations[key] {
+					annotationsChanged = true
+					break
+				}
+			}
+
+			if annotationsChanged {
+				log.Info().Msgf("[Core] [%s] Annotations changed, updating records", service.Name)
+				records.HandleUpdates(
+					existingRecords,
+					ingressDestination,
+					zonesToNames,
+					service,
+					oldService,
+				)
+			}
 		},
 		DeleteFunc: func(obj interface{}) {
 			service, ok := obj.(*v1.Service)
