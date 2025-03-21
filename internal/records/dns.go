@@ -53,6 +53,7 @@ func HandleAnnotations(
 			ttl,
 			zone.ID,
 			service,
+			existingRecords,
 		)
 		if cfErr != nil {
 			log.Error().Err(cfErr).Msgf("[DNS] [%s] Failed to create record", meta.Name)
@@ -76,6 +77,84 @@ func HandleAnnotations(
 			return
 		}
 		log.Debug().Msgf("[DNS] [%s] Record exists", meta.Name)
+		cf.CleanupRecords(existingRecords, service, meta.Name, zone.ID)
+	}
+}
+
+func HandleUpdates(
+	existingRecords map[string]dns.RecordResponse,
+	ingressDestination string,
+	zonesToNames map[string]string,
+	service *v1.Service,
+	oldService *v1.Service,
+) {
+	meta := service.ObjectMeta
+	oldMeta := oldService.ObjectMeta
+	enabled := meta.Annotations["greydns.io/dns"]
+	if enabled == "true" {
+		log.Info().Msgf("[DNS] Service %s has DNS enabled", meta.Name)
+	} else {
+		return
+	}
+
+	// Check if the zone exists
+	// TODO:: Support multiple zones
+	zone, err := cf.CheckIfZoneExists(zonesToNames, meta.Annotations["greydns.io/zone"])
+	if err != nil {
+		log.Error().Err(err).Msgf("[DNS] [%s] Zone does not exist", meta.Name)
+		return
+	}
+	log.Debug().Msgf("[DNS] [%s] Belongs to zone: %s", meta.Name, zone.Name)
+
+	// Check if the record exists
+	_, exists := existingRecords[oldMeta.Annotations["greydns.io/domain"]]
+	if !exists { //nolint:nestif // TODO:: Refactor
+		log.Info().Msgf("[DNS] [%s] Record does not exist, attempting to create", meta.Name)
+
+		HandleAnnotations(
+			existingRecords,
+			ingressDestination,
+			zonesToNames,
+			service,
+		)
+	} else {
+		// Ensure this service is the owner of the record
+		if existingRecords[oldMeta.Annotations["greydns.io/domain"]].Comment !=
+			"[greydns - Do not manually edit]"+
+				meta.Namespace+"/"+meta.Name {
+			utils.Recorder.Eventf(
+				service,
+				v1.EventTypeWarning,
+				"DuplicateDomain",
+				"Duplicate domain entry, this domain is already owned by another service",
+			)
+			return
+		}
+		log.Debug().Msgf("[DNS] [%s] Record exists attempting to update", meta.Name)
+
+		ttl, ttlErr := strconv.Atoi(cfg.GetRequiredConfigValue("record-ttl"))
+		if ttlErr != nil {
+			log.Fatal().Err(ttlErr).Msg("[DNS] TTL is not a valid integer")
+		}
+
+		// Create the record
+		// TODO:: Support multiple record types
+		dnsRecord, cfErr := cf.UpdateRecord(
+			existingRecords[oldMeta.Annotations["greydns.io/domain"]].ID,
+			meta.Annotations["greydns.io/domain"],
+			ingressDestination,
+			ttl,
+			zone.ID,
+			service,
+		)
+		if cfErr != nil {
+			log.Error().Err(cfErr).Msgf("[DNS] [%s] Failed to update record", meta.Name)
+		} else {
+			log.Info().Msgf("[DNS] [%s] Record updated", meta.Name)
+
+			// Add the record to the cache
+			existingRecords[meta.Annotations["greydns.io/domain"]] = *dnsRecord
+		}
 	}
 }
 

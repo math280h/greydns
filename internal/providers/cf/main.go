@@ -28,7 +28,85 @@ func Connect(
 	)
 }
 
+func CleanupRecords(
+	existingRecords map[string]dns.RecordResponse,
+	service *v1.Service,
+	name string,
+	zoneID string,
+) {
+	// Check if namespace/service already has another record using comments, if so, delete it in existingRecords
+	for _, record := range existingRecords {
+		if record.Comment == "[greydns - Do not manually edit]"+service.Namespace+"/"+service.Name {
+			// Ensure its not the current record
+			if service.ObjectMeta.Annotations["greydns.io/domain"] == record.Name {
+				continue
+			}
+			log.Info().Msgf("[CF Provider] [%s] Found old record, cleaning up", name)
+			err := DeleteRecord(record.ID, zoneID)
+			if err != nil {
+				log.Error().Err(err).Msgf("[CF Provider] [%s] Failed to delete record", name)
+			}
+			delete(existingRecords, record.Name)
+		}
+	}
+}
+
 func CreateRecord(
+	name string,
+	ingressDestination string,
+	ttl int,
+	zoneID string,
+	service *v1.Service,
+	existingRecords map[string]dns.RecordResponse,
+) (*dns.RecordResponse, error) {
+	recordType := cfg.GetRequiredConfigValue("record-type")
+	proxied := cfg.GetRequiredConfigValue("proxy-enabled") == "true"
+
+	var record dns.RecordUnionParam
+	switch recordType {
+	case "A":
+		record = dns.ARecordParam{
+			Type:    cloudflare.F(dns.ARecordType("A")),
+			Name:    cloudflare.F(name),
+			Content: cloudflare.F(ingressDestination),
+			TTL:     cloudflare.F(dns.TTL(ttl)),
+			Comment: cloudflare.F("[greydns - Do not manually edit]" + service.Namespace + "/" + service.Name),
+			Proxied: cloudflare.F(proxied),
+		}
+	case "CNAME":
+		record = dns.CNAMERecordParam{
+			Type:    cloudflare.F(dns.CNAMERecordType("CNAME")),
+			Name:    cloudflare.F(name),
+			Content: cloudflare.F(ingressDestination),
+			TTL:     cloudflare.F(dns.TTL(ttl)),
+			Comment: cloudflare.F("[greydns - Do not manually edit]"),
+			Proxied: cloudflare.F(proxied),
+		}
+	default:
+		log.Error().Msgf("[CF Provider] Invalid record type: %s", recordType)
+		return nil, errors.New("invalid record type")
+	}
+
+	CleanupRecords(existingRecords, service, name, zoneID)
+
+	dnsRecord, err := cloudflareAPI.DNS.Records.New(
+		context.Background(),
+		dns.RecordNewParams{
+			ZoneID: cloudflare.F(zoneID),
+			Record: record,
+		},
+	)
+	if err != nil {
+		log.Error().Err(err).Msgf("[CF Provider] [%s] Failed to create record", name)
+	} else {
+		log.Info().Msgf("[CF Provider] [%s] Record created", name)
+	}
+
+	return dnsRecord, err
+}
+
+func UpdateRecord(
+	recordID string,
 	name string,
 	ingressDestination string,
 	ttl int,
@@ -62,17 +140,18 @@ func CreateRecord(
 		log.Error().Msgf("[CF Provider] Invalid record type: %s", recordType)
 		return nil, errors.New("invalid record type")
 	}
-	dnsRecord, err := cloudflareAPI.DNS.Records.New(
+	dnsRecord, err := cloudflareAPI.DNS.Records.Update(
 		context.Background(),
-		dns.RecordNewParams{
+		recordID,
+		dns.RecordUpdateParams{
 			ZoneID: cloudflare.F(zoneID),
 			Record: record,
 		},
 	)
 	if err != nil {
-		log.Error().Err(err).Msgf("[CF Provider] [%s] Failed to create record", name)
+		log.Error().Err(err).Msgf("[CF Provider] [%s] Failed to update record", name)
 	} else {
-		log.Info().Msgf("[CF Provider] [%s] Record created", name)
+		log.Info().Msgf("[CF Provider] [%s] Record updated", name)
 	}
 
 	return dnsRecord, err
