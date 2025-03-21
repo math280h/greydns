@@ -95,12 +95,14 @@ GreyDNS will create an event on the service if it detects a record that is alrea
 
 ## 🔍 Configuration
 
-| Config Key | Description | Default |
+| Config Key | Description | Required |
 |------------|-------------|---------|
-| record-ttl | DNS record time-to-live in seconds | 60 |
-| record-type | DNS record type (A or CNAME) | A |
-| proxy-enabled | Enable CloudFlare proxy | true |
-| cache-refresh-seconds | Cache refresh interval | 60 |
+| record-ttl | DNS record time-to-live in seconds | True |
+| record-type | DNS record type (A or CNAME) | True |
+| proxy-enabled | Enable CloudFlare proxy | True |
+| cache-refresh-seconds | Cache refresh interval | True |
+| ingress-destination | Ingress controller IP address | True |
+| proxy-enabled | Enable CloudFlare proxy | True |
 
 ## 🤔 Why Not ExternalDNS?
 
