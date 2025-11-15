@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cloudflare/cloudflare-go/v4/dns"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -19,15 +18,17 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	cfg "github.com/math280h/greydns/internal/config"
-	cf "github.com/math280h/greydns/internal/providers/cf"
+	"github.com/math280h/greydns/internal/providers"
 	"github.com/math280h/greydns/internal/records"
+	"github.com/math280h/greydns/internal/types"
 	"github.com/math280h/greydns/internal/utils"
 )
 
 var (
-	ingressDestination string                                //nolint:gochecknoglobals // Required for ingress destination
-	zonesToNames       = make(map[string]string)             //nolint:gochecknoglobals // Required for zones
-	existingRecords    = make(map[string]dns.RecordResponse) //nolint:gochecknoglobals // Required for existing records
+	ingressDestination string                              //nolint:gochecknoglobals // Required for ingress destination
+	zonesToNames       = make(map[string]string)           //nolint:gochecknoglobals // Required for zones
+	existingRecords    = make(map[string]*types.DNSRecord) //nolint:gochecknoglobals // Required for existing records
+	providerManager    *providers.Manager                  //nolint:gochecknoglobals // Required for provider management
 )
 
 func main() { //nolint:gocognit // Required for main function
@@ -57,12 +58,38 @@ func main() { //nolint:gocognit // Required for main function
 		clientset,
 	)
 
-	// TODO:: Support multiple providers
-	cf.Connect(secret)
-	zonesToNames = cf.GetZoneNames()
-	existingRecords = cf.RefreshRecordsCache(
-		zonesToNames,
-	)
+	// Initialize DNS provider
+	providerName := "cloudflare" // Default to Cloudflare for backward compatibility
+	if configuredProvider, exists := cfg.ConfigMap.Data["provider"]; exists && configuredProvider != "" {
+		providerName = configuredProvider
+	}
+
+	providerManager, err = providers.NewManager(providerName)
+	if err != nil {
+		log.Fatal().Err(err).Msg("[Core] Failed to create provider manager")
+	}
+
+	// Convert secret to credentials map
+	credentials := make(map[string]string)
+	for key, value := range secret.Data {
+		credentials[key] = string(value)
+	}
+
+	err = providerManager.Connect(credentials)
+	if err != nil {
+		log.Fatal().Err(err).Msg("[Core] Failed to connect to DNS provider")
+	}
+
+	zonesToNames, err = providerManager.GetZones()
+	if err != nil {
+		log.Fatal().Err(err).Msg("[Core] Failed to get zones")
+	}
+
+	existingRecords, err = providerManager.RefreshRecordsCache(zonesToNames)
+	if err != nil {
+		log.Fatal().Err(err).Msg("[Core] Failed to refresh records cache")
+	}
+
 	go func() {
 		for {
 			sleepTime, strconvErr := strconv.ParseInt(cfg.GetRequiredConfigValue("cache-refresh-seconds"), 0, 64)
@@ -70,9 +97,12 @@ func main() { //nolint:gocognit // Required for main function
 				log.Fatal().Err(strconvErr).Msg("[Core] Sleep time is not a valid integer")
 			}
 			time.Sleep(time.Duration(sleepTime) * time.Second)
-			existingRecords = cf.RefreshRecordsCache(
-				zonesToNames,
-			)
+			refreshedRecords, refreshErr := providerManager.RefreshRecordsCache(zonesToNames)
+			if refreshErr != nil {
+				log.Error().Err(refreshErr).Msg("[Core] Failed to refresh records cache")
+			} else {
+				existingRecords = refreshedRecords
+			}
 		}
 	}()
 
@@ -89,6 +119,7 @@ func main() { //nolint:gocognit // Required for main function
 				return
 			}
 			records.HandleAnnotations(
+				providerManager.GetProvider(),
 				existingRecords,
 				ingressDestination,
 				zonesToNames,
@@ -122,6 +153,7 @@ func main() { //nolint:gocognit // Required for main function
 			if annotationsChanged {
 				log.Info().Msgf("[Core] [%s] Annotations changed, updating records", service.Name)
 				records.HandleUpdates(
+					providerManager.GetProvider(),
 					existingRecords,
 					ingressDestination,
 					zonesToNames,
@@ -137,6 +169,7 @@ func main() { //nolint:gocognit // Required for main function
 				return
 			}
 			records.HandleDeletions(
+				providerManager.GetProvider(),
 				existingRecords,
 				zonesToNames,
 				service,
