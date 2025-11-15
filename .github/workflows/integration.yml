@@ -48,7 +48,11 @@ jobs:
 
     - name: Load image to Kind
       run: |
+        echo "=== Loading image to Kind cluster ==="
         kind load docker-image greydns:integration --name greydns-integration
+        
+        echo "=== Verifying image is loaded ==="
+        docker exec greydns-integration-control-plane crictl images | grep greydns || echo "Image not found in cluster"
 
     - name: Deploy GreyDNS to Kind cluster
       env:
@@ -73,13 +77,37 @@ jobs:
         kubectl create secret generic greydns-secret -n greydns-integration \
           --from-literal=cloudflare=$CLOUDFLARE_API_TOKEN
         
-        # Apply deployment
+        echo "=== Verifying ConfigMap creation ==="
+        kubectl get configmap greydns-config -n greydns-integration -o yaml
+        echo "=== Verifying Secret exists (without exposing contents) ==="
+        kubectl get secret greydns-secret -n greydns-integration
+        
+        # Apply deployment with proper image substitution
         sed 's/namespace: default/namespace: greydns-integration/g' deployment.yaml | \
-        sed 's/image: greydns:latest/image: greydns:integration/g' | \
+        sed 's|image: ghcr.io/math280h/greydns/greydns:latest|image: greydns:integration|g' | \
+        sed 's/imagePullPolicy: IfNotPresent/imagePullPolicy: Never/g' | \
         kubectl apply -f -
         
-        # Wait for deployment to be ready
-        kubectl wait --for=condition=available --timeout=300s deployment/greydns -n greydns-integration
+        # Check deployment status with debugging
+        echo "=== Deployment Status ==="
+        kubectl get deployment greydns -n greydns-integration -o wide
+        
+        echo "=== Pod Status ==="
+        kubectl get pods -n greydns-integration -o wide
+        
+        echo "=== Events ==="
+        kubectl get events -n greydns-integration --sort-by='.lastTimestamp'
+        
+        # Wait for deployment to be ready with increased timeout
+        echo "=== Waiting for deployment to become available ==="
+        if ! kubectl wait --for=condition=available --timeout=600s deployment/greydns -n greydns-integration; then
+          echo "=== Deployment failed - gathering debug info ==="
+          kubectl describe deployment greydns -n greydns-integration
+          kubectl describe pods -n greydns-integration
+          kubectl logs -n greydns-integration deployment/greydns --all-containers --previous || true
+          kubectl logs -n greydns-integration deployment/greydns --all-containers || true
+          exit 1
+        fi
 
     - name: Run integration tests
       env:
