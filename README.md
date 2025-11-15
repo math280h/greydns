@@ -16,26 +16,52 @@ GreyDNS enables development teams to manage their DNS records directly through K
 - **Real-time Updates**: Automatically syncs DNS records when annotations change
 - **Lightweight**: Minimal resource footprint with efficient caching
 
-## 📦 Supported DNS Providers
+## 📦 DNS Providers
 
-- **CloudFlare Support**: Native integration with CloudFlare DNS
+GreyDNS uses a modular provider architecture that makes it easy to support multiple DNS services.
 
-### Coming Soon
+### Currently Supported
 
-- **AWS Route 53 Support**: Integration with AWS Route 53
-- **Google Cloud DNS Support**: Integration with Google Cloud DNS
-- **Azure DNS Support**: Integration with Azure DNS
+- **CloudFlare**: Full support with proxy features, A/CNAME records, and automatic cleanup
+
+### Provider Configuration
+
+Configure your DNS provider in the ConfigMap:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: greydns-config
+  namespace: default
+data:
+  provider: "cloudflare"  # Specify your DNS provider
+  record-ttl: "60"
+  record-type: "A"
+  cache-refresh-seconds: "60"
+  ingress-destination: "YOUR_INGRESS_IP"
+  proxy-enabled: "true"
+```
+
+If no `provider` is specified, it defaults to CloudFlare for backward compatibility.
 
 ## 📋 Prerequisites
 
 - Kubernetes cluster (1.19+)
 - `kubectl` configured to access your cluster
 
-### CloudFlare
+### CloudFlare Setup
 
 - CloudFlare API token with the following permissions:
   - Zone: Read
   - DNS: Edit
+
+Create the CloudFlare API token secret:
+
+```sh
+kubectl create secret generic greydns-secret \
+  --from-literal=cloudflare=YOUR_API_TOKEN
+```
 
 ## 🛠️ Installation
 
@@ -54,6 +80,7 @@ GreyDNS enables development teams to manage their DNS records directly through K
       name: greydns-config
       namespace: default
     data:
+      provider: "cloudflare"  # DNS provider to use
       record-ttl: "60"
       record-type: "A"
       cache-refresh-seconds: "60"
@@ -61,11 +88,11 @@ GreyDNS enables development teams to manage their DNS records directly through K
       proxy-enabled: "true"
     ```
 
-3. Create the CloudFlare API token secret:
+3. Create your DNS provider credentials secret (example for CloudFlare):
 
     ```sh
     kubectl create secret generic greydns-secret \
-    --from-literal=cloudflare=YOUR_API_TOKEN
+      --from-literal=cloudflare=YOUR_API_TOKEN
     ```
 
 ## 📝 Usage
@@ -97,12 +124,23 @@ GreyDNS will create an event on the service if it detects a record that is alrea
 
 | Config Key | Description | Required |
 |------------|-------------|---------|
+| provider | DNS provider to use (default: cloudflare) | False |
 | record-ttl | DNS record time-to-live in seconds | True |
 | record-type | DNS record type (A or CNAME) | True |
 | proxy-enabled | Enable CloudFlare proxy | True |
 | cache-refresh-seconds | Cache refresh interval | True |
 | ingress-destination | Ingress controller IP address | True |
-| proxy-enabled | Enable CloudFlare proxy | True |
+
+## 🔧 Adding New DNS Providers
+
+GreyDNS uses a modular architecture that makes adding new DNS providers straightforward:
+
+1. **Create a provider package** under `internal/providers/yourprovider/`
+2. **Implement the Provider interface** with methods like `Connect()`, `CreateRecord()`, `UpdateRecord()`, etc.
+3. **Register the provider** in the provider manager
+4. **Add credentials** to the secret with the appropriate key
+
+The system uses generic DNS record types that work across all providers, making the core logic provider-agnostic.
 
 ## 🤔 Why Not ExternalDNS?
 

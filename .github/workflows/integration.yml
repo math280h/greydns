@@ -1,0 +1,114 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [ main, feat/rework ]
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'test/integration/**'
+      - 'deployment.yaml'
+      - 'Dockerfile'
+  workflow_dispatch: # Allow manual trigger
+
+env:
+  GO_VERSION: '1.24.1'
+
+jobs:
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Create k8s Kind Cluster
+      uses: helm/kind-action@v1.8.0
+      with:
+        cluster_name: greydns-integration
+        config: test/integration/kind-config.yaml
+
+    - name: Build Docker image
+      run: |
+        docker build -t greydns:integration .
+
+    - name: Load image to Kind
+      run: |
+        kind load docker-image greydns:integration --name greydns-integration
+
+    - name: Deploy GreyDNS to Kind cluster
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_INT_TEST_ZONE_ID }}
+        CLOUDFLARE_ZONE_NAME: "int-test.greydns.io"
+        TEST_INGRESS_IP: ${{ secrets.TEST_INGRESS_IP }}
+      run: |
+        # Create namespace
+        kubectl create namespace greydns-integration
+        
+        # Create ConfigMap with real configuration
+        kubectl create configmap greydns-config -n greydns-integration \
+          --from-literal=provider=cloudflare \
+          --from-literal=record-ttl=60 \
+          --from-literal=record-type=A \
+          --from-literal=cache-refresh-seconds=30 \
+          --from-literal=ingress-destination=$TEST_INGRESS_IP \
+          --from-literal=proxy-enabled=false
+        
+        # Create secret with real Cloudflare token
+        kubectl create secret generic greydns-secret -n greydns-integration \
+          --from-literal=cloudflare=$CLOUDFLARE_API_TOKEN
+        
+        # Apply deployment
+        sed 's/namespace: default/namespace: greydns-integration/g' deployment.yaml | \
+        sed 's/image: greydns:latest/image: greydns:integration/g' | \
+        kubectl apply -f -
+        
+        # Wait for deployment to be ready
+        kubectl wait --for=condition=available --timeout=300s deployment/greydns -n greydns-integration
+
+    - name: Run integration tests
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_INT_TEST_ZONE_ID }}
+        CLOUDFLARE_ZONE_NAME: "int-test.greydns.io"
+        TEST_INGRESS_IP: ${{ secrets.TEST_INGRESS_IP }}
+        KUBECONFIG: ~/.kube/config
+      run: |
+        # Run integration tests with real Cloudflare provider
+        go test -v -tags=integration -timeout=10m ./test/integration/...
+
+    - name: Cleanup test records
+      if: always()
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_INT_TEST_ZONE_ID }}
+      run: |
+        # Clean up any test DNS records that might be left behind
+        go run ./test/integration/cleanup/main.go
+
+    - name: Export logs on failure
+      if: failure()
+      run: |
+        echo "=== GreyDNS Controller Logs ==="
+        kubectl logs -n greydns-integration deployment/greydns --tail=100
+        
+        echo "=== Events ==="
+        kubectl get events -n greydns-integration --sort-by='.lastTimestamp'
+        
+        echo "=== Pod Status ==="
+        kubectl get pods -n greydns-integration -o wide
