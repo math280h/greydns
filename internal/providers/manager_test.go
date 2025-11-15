@@ -146,8 +146,39 @@ func (m *mockProvider) CleanupRecords(existingRecords map[string]*types.DNSRecor
 }
 
 func TestManager_WithMockProvider(t *testing.T) {
-	// This would require modifying the Manager to accept custom providers
-	// For now, we test the actual cloudflare provider integration
+	// Create mock provider to test the structure
+	mock := &mockProvider{
+		zones: map[string]string{
+			"example.com": "zone123",
+		},
+		records: map[string]*types.DNSRecord{
+			"test.example.com": {
+				ID:      "record123",
+				Name:    "test.example.com",
+				Type:    "A",
+				Content: "192.0.2.1",
+				TTL:     300,
+				ZoneID:  "zone123",
+			},
+		},
+	}
+
+	// Test mock provider methods work
+	assert.Equal(t, "mock", mock.Name())
+
+	err := mock.Connect(map[string]string{"test": "token"})
+	assert.NoError(t, err)
+	assert.True(t, mock.connectCalled)
+
+	zones, err := mock.GetZones()
+	assert.NoError(t, err)
+	assert.Equal(t, "zone123", zones["example.com"])
+
+	zone, err := mock.CheckZoneExists("example.com", zones)
+	assert.NoError(t, err)
+	assert.Equal(t, "example.com", zone.Name)
+
+	// Test the actual cloudflare provider integration
 	manager, err := NewManager("cloudflare")
 	require.NoError(t, err)
 

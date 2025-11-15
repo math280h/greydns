@@ -125,7 +125,7 @@ func TestProvider_ErrorHandling(t *testing.T) {
 
 	// Now test methods that require a connected client
 	// These will fail with invalid token, but structure should be correct
-	_, err = provider.GetZones()
+	_, _ = provider.GetZones()
 	// We expect an error here with invalid credentials, which is fine
 }
 

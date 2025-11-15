@@ -292,7 +292,7 @@ func CleanupRecords(
 	for _, record := range existingRecords {
 		if record.Comment == "[greydns - Do not manually edit]"+service.Namespace+"/"+service.Name {
 			// Ensure its not the current record
-			if service.ObjectMeta.Annotations["greydns.io/domain"] == record.Name {
+			if service.Annotations["greydns.io/domain"] == record.Name {
 				continue
 			}
 			log.Info().Msgf("[CF Provider] [%s] Found old record, cleaning up", name)
