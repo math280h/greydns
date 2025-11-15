@@ -9,6 +9,7 @@ on:
       - 'test/integration/**'
       - 'deployment.yaml'
       - 'Dockerfile'
+      - '.github/workflows/integration.yml'
   workflow_dispatch: # Allow manual trigger
 
 env:
