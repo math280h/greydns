@@ -62,8 +62,8 @@ func TestIntegration_CloudflareProvider(t *testing.T) {
 		assert.Equal(t, zoneID, zone.ID)
 	})
 
-	// Test record operations with real DNS under int-test.greydns.io
-	testDomain := fmt.Sprintf("provider-test-%d.int-test.greydns.io", time.Now().Unix())
+	// Test record operations with real DNS under int-test.greydns.io subdomain
+	testDomain := fmt.Sprintf("provider-test-%d.int-test.%s", time.Now().Unix(), zoneName)
 
 	t.Run("CreateRecord", func(t *testing.T) {
 		params := types.CreateRecordParams{
@@ -73,6 +73,7 @@ func TestIntegration_CloudflareProvider(t *testing.T) {
 			TTL:     60,
 			Comment: "[greydns - Do not manually edit]integration/test",
 			ZoneID:  zoneID,
+			Proxied: &[]bool{false}[0], // Explicitly set proxied to false
 		}
 
 		record, err := manager.CreateRecord(params)
@@ -99,6 +100,7 @@ func TestIntegration_CloudflareProvider(t *testing.T) {
 				TTL:      120,
 				Comment:  "[greydns - Do not manually edit]integration/test-updated",
 				ZoneID:   zoneID,
+				Proxied:  &[]bool{false}[0], // Explicitly set proxied to false
 			}
 
 			updatedRecord, err := manager.UpdateRecord(updateParams)
@@ -141,8 +143,8 @@ func TestIntegration_KubernetesController(t *testing.T) {
 	})
 
 	// Create a test service and verify DNS record creation
-	if zoneName := os.Getenv("CLOUDFLARE_ZONE_NAME"); zoneName == "int-test.greydns.io" {
-		testDomain := fmt.Sprintf("k8s-svc-test-%d.int-test.greydns.io", time.Now().Unix())
+	if zoneName := os.Getenv("CLOUDFLARE_ZONE_NAME"); zoneName != "" {
+		testDomain := fmt.Sprintf("k8s-svc-test-%d.int-test.%s", time.Now().Unix(), zoneName)
 
 		t.Run("ServiceDNSIntegration", func(t *testing.T) {
 			// Create test service
@@ -153,7 +155,7 @@ func TestIntegration_KubernetesController(t *testing.T) {
 					Annotations: map[string]string{
 						"greydns.io/dns":    "true",
 						"greydns.io/domain": testDomain,
-						"greydns.io/zone":   "int-test.greydns.io",
+						"greydns.io/zone":   zoneName,
 					},
 				},
 				Spec: v1.ServiceSpec{
@@ -205,7 +207,7 @@ func TestIntegration_KubernetesController(t *testing.T) {
 					assert.Contains(t, record.Comment, "test-service-integration")
 
 					// Cleanup the DNS record
-					err := manager.DeleteRecord(record.ID, zones["int-test.greydns.io"])
+					err := manager.DeleteRecord(record.ID, zones[zoneName])
 					if err != nil {
 						t.Logf("Failed to cleanup DNS record: %v", err)
 					}
