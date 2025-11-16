@@ -87,7 +87,9 @@ jobs:
         sed 's/namespace: default/namespace: greydns-integration/g' deployment.yaml | \
         sed 's|image: ghcr.io/math280h/greydns/greydns:latest|image: greydns:integration|g' | \
         sed 's/imagePullPolicy: IfNotPresent/imagePullPolicy: Never/g' | \
-        sed 's/fieldPath: metadata.namespace/value: "greydns-integration"/g' | \
+        sed 's/valueFrom:/value: "greydns-integration"/' | \
+        sed '/fieldRef:/d' | \
+        sed '/fieldPath:/d' | \
         kubectl apply -f -
         
         # Check deployment status with debugging
