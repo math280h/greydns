@@ -83,10 +83,11 @@ jobs:
         echo "=== Verifying Secret exists (without exposing contents) ==="
         kubectl get secret greydns-secret -n greydns-integration
         
-        # Apply deployment with proper image substitution
+        # Apply deployment with proper image substitution and namespace configuration
         sed 's/namespace: default/namespace: greydns-integration/g' deployment.yaml | \
         sed 's|image: ghcr.io/math280h/greydns/greydns:latest|image: greydns:integration|g' | \
         sed 's/imagePullPolicy: IfNotPresent/imagePullPolicy: Never/g' | \
+        sed 's/fieldPath: metadata.namespace/value: "greydns-integration"/g' | \
         kubectl apply -f -
         
         # Check deployment status with debugging

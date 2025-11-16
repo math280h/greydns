@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"os"
 
 	"github.com/rs/zerolog/log"
 
@@ -26,9 +27,14 @@ func GetRequiredConfigValue(key string) string {
 func LoadConfigMap(
 	clientset *kubernetes.Clientset,
 ) {
+	namespace := os.Getenv("GREYDNS_NAMESPACE")
+	if namespace == "" {
+		namespace = "default"
+	}
+
 	var err error
 	ConfigMap, err = clientset.CoreV1().ConfigMaps(
-		"default",
+		namespace,
 	).Get(context.Background(), "greydns-config", metav1.GetOptions{})
 	if err != nil {
 		log.Fatal().Err(err).Msg("[Config] Failed to get configmap")

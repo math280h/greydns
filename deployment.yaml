@@ -18,6 +18,11 @@ spec:
         - name: greydns
           image: ghcr.io/math280h/greydns/greydns:latest
           imagePullPolicy: IfNotPresent
+          env:
+            - name: GREYDNS_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           resources:
             limits:
               cpu: "500m"

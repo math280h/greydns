@@ -47,7 +47,12 @@ func main() { //nolint:gocognit // Required for main function
 
 	cfg.LoadConfigMap(clientset)
 
-	secret, err := clientset.CoreV1().Secrets("default").Get(context.Background(), "greydns-secret", metav1.GetOptions{})
+	namespace := os.Getenv("GREYDNS_NAMESPACE")
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	secret, err := clientset.CoreV1().Secrets(namespace).Get(context.Background(), "greydns-secret", metav1.GetOptions{})
 	if err != nil {
 		log.Fatal().Err(err).Msg("[Core] Failed to get secret")
 	}
