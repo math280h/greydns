@@ -1,0 +1,30 @@
+# Test coverage settings for codecov
+coverage:
+  precision: 2
+  round: down
+  range: 70...95
+
+  status:
+    project:
+      default:
+        target: 80%
+        threshold: 5%
+        if_not_found: success
+        only_pulls: false
+        
+    patch:
+      default:
+        target: 80%
+        threshold: 5%
+
+ignore:
+  - "**/*_test.go"
+  - "**/vendor/**"
+  - "**/testdata/**"
+  - "**/mock/**"
+  - "cmd/main.go"  # Main function is hard to unit test
+
+comment:
+  layout: "reach,diff,flags,tree"
+  behavior: default
+  require_changes: false

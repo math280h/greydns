@@ -3,17 +3,29 @@ package records
 import (
 	"strconv"
 
-	"github.com/cloudflare/cloudflare-go/v4/dns"
 	"github.com/rs/zerolog/log"
 	v1 "k8s.io/api/core/v1"
 
 	cfg "github.com/math280h/greydns/internal/config"
-	cf "github.com/math280h/greydns/internal/providers/cf"
+	"github.com/math280h/greydns/internal/types"
 	"github.com/math280h/greydns/internal/utils"
 )
 
+// DNSManager handles DNS operations using any provider
+type DNSManager struct {
+	provider types.Provider
+}
+
+// NewDNSManager creates a new DNS manager with the specified provider
+func NewDNSManager(provider types.Provider) *DNSManager {
+	return &DNSManager{
+		provider: provider,
+	}
+}
+
 func HandleAnnotations(
-	existingRecords map[string]dns.RecordResponse,
+	provider types.Provider,
+	existingRecords map[string]*types.DNSRecord,
 	ingressDestination string,
 	zonesToNames map[string]string,
 	service *v1.Service,
@@ -27,8 +39,7 @@ func HandleAnnotations(
 	}
 
 	// Check if the zone exists
-	// TODO:: Support multiple zones
-	zone, err := cf.CheckIfZoneExists(zonesToNames, meta.Annotations["greydns.io/zone"])
+	zone, err := provider.CheckZoneExists(meta.Annotations["greydns.io/zone"], zonesToNames)
 	if err != nil {
 		log.Error().Err(err).Msgf("[DNS] [%s] Zone does not exist", meta.Name)
 		return
@@ -36,8 +47,9 @@ func HandleAnnotations(
 	log.Debug().Msgf("[DNS] [%s] Belongs to zone: %s", meta.Name, zone.Name)
 
 	// Check if the record exists
-	_, exists := existingRecords[meta.Annotations["greydns.io/domain"]]
-	if !exists { //nolint:nestif // TODO:: Refactor
+	domain := meta.Annotations["greydns.io/domain"]
+	_, exists := existingRecords[domain]
+	if !exists {
 		log.Info().Msgf("[DNS] [%s] Record does not exist, attempting to create", meta.Name)
 
 		ttl, ttlErr := strconv.Atoi(cfg.GetRequiredConfigValue("record-ttl"))
@@ -45,29 +57,31 @@ func HandleAnnotations(
 			log.Fatal().Err(ttlErr).Msg("[DNS] TTL is not a valid integer")
 		}
 
+		recordType := types.RecordType(cfg.GetRequiredConfigValue("record-type"))
+
 		// Create the record
-		// TODO:: Support multiple record types
-		dnsRecord, cfErr := cf.CreateRecord(
-			meta.Annotations["greydns.io/domain"],
-			ingressDestination,
-			ttl,
-			zone.ID,
-			service,
-			existingRecords,
-		)
-		if cfErr != nil {
-			log.Error().Err(cfErr).Msgf("[DNS] [%s] Failed to create record", meta.Name)
+		params := types.CreateRecordParams{
+			Name:    domain,
+			Type:    recordType,
+			Content: ingressDestination,
+			TTL:     ttl,
+			Comment: "[greydns - Do not manually edit]" + meta.Namespace + "/" + meta.Name,
+			ZoneID:  zone.ID,
+		}
+
+		dnsRecord, createErr := provider.CreateRecord(params)
+		if createErr != nil {
+			log.Error().Err(createErr).Msgf("[DNS] [%s] Failed to create record", meta.Name)
 		} else {
 			log.Info().Msgf("[DNS] [%s] Record created", meta.Name)
 
 			// Add the record to the cache
-			existingRecords[meta.Annotations["greydns.io/domain"]] = *dnsRecord
+			existingRecords[domain] = dnsRecord
 		}
 	} else {
 		// Ensure this service is the owner of the record
-		if existingRecords[meta.Annotations["greydns.io/domain"]].Comment !=
-			"[greydns - Do not manually edit]"+
-				meta.Namespace+"/"+meta.Name {
+		expectedComment := "[greydns - Do not manually edit]" + meta.Namespace + "/" + meta.Name
+		if existingRecords[domain].Comment != expectedComment {
 			utils.Recorder.Eventf(
 				service,
 				v1.EventTypeWarning,
@@ -77,12 +91,18 @@ func HandleAnnotations(
 			return
 		}
 		log.Debug().Msgf("[DNS] [%s] Record exists", meta.Name)
-		cf.CleanupRecords(existingRecords, service, meta.Name, zone.ID)
+
+		// Cleanup old records for this service
+		cleanupErr := provider.CleanupRecords(existingRecords, meta.Namespace, meta.Name, zone.ID, domain)
+		if cleanupErr != nil {
+			log.Error().Err(cleanupErr).Msgf("[DNS] [%s] Failed to cleanup records", meta.Name)
+		}
 	}
 }
 
 func HandleUpdates(
-	existingRecords map[string]dns.RecordResponse,
+	provider types.Provider,
+	existingRecords map[string]*types.DNSRecord,
 	ingressDestination string,
 	zonesToNames map[string]string,
 	service *v1.Service,
@@ -98,20 +118,23 @@ func HandleUpdates(
 	}
 
 	// Check if the zone exists
-	// TODO:: Support multiple zones
-	zone, err := cf.CheckIfZoneExists(zonesToNames, meta.Annotations["greydns.io/zone"])
+	zone, err := provider.CheckZoneExists(meta.Annotations["greydns.io/zone"], zonesToNames)
 	if err != nil {
 		log.Error().Err(err).Msgf("[DNS] [%s] Zone does not exist", meta.Name)
 		return
 	}
 	log.Debug().Msgf("[DNS] [%s] Belongs to zone: %s", meta.Name, zone.Name)
 
+	oldDomain := oldMeta.Annotations["greydns.io/domain"]
+	newDomain := meta.Annotations["greydns.io/domain"]
+
 	// Check if the record exists
-	_, exists := existingRecords[oldMeta.Annotations["greydns.io/domain"]]
-	if !exists { //nolint:nestif // TODO:: Refactor
+	existingRecord, exists := existingRecords[oldDomain]
+	if !exists {
 		log.Info().Msgf("[DNS] [%s] Record does not exist, attempting to create", meta.Name)
 
 		HandleAnnotations(
+			provider,
 			existingRecords,
 			ingressDestination,
 			zonesToNames,
@@ -119,9 +142,8 @@ func HandleUpdates(
 		)
 	} else {
 		// Ensure this service is the owner of the record
-		if existingRecords[oldMeta.Annotations["greydns.io/domain"]].Comment !=
-			"[greydns - Do not manually edit]"+
-				meta.Namespace+"/"+meta.Name {
+		expectedComment := "[greydns - Do not manually edit]" + meta.Namespace + "/" + meta.Name
+		if existingRecord.Comment != expectedComment {
 			utils.Recorder.Eventf(
 				service,
 				v1.EventTypeWarning,
@@ -137,29 +159,37 @@ func HandleUpdates(
 			log.Fatal().Err(ttlErr).Msg("[DNS] TTL is not a valid integer")
 		}
 
-		// Create the record
-		// TODO:: Support multiple record types
-		dnsRecord, cfErr := cf.UpdateRecord(
-			existingRecords[oldMeta.Annotations["greydns.io/domain"]].ID,
-			meta.Annotations["greydns.io/domain"],
-			ingressDestination,
-			ttl,
-			zone.ID,
-			service,
-		)
-		if cfErr != nil {
-			log.Error().Err(cfErr).Msgf("[DNS] [%s] Failed to update record", meta.Name)
+		recordType := types.RecordType(cfg.GetRequiredConfigValue("record-type"))
+
+		// Update the record
+		params := types.UpdateRecordParams{
+			RecordID: existingRecord.ID,
+			Name:     newDomain,
+			Type:     recordType,
+			Content:  ingressDestination,
+			TTL:      ttl,
+			Comment:  "[greydns - Do not manually edit]" + meta.Namespace + "/" + meta.Name,
+			ZoneID:   zone.ID,
+		}
+
+		dnsRecord, updateErr := provider.UpdateRecord(params)
+		if updateErr != nil {
+			log.Error().Err(updateErr).Msgf("[DNS] [%s] Failed to update record", meta.Name)
 		} else {
 			log.Info().Msgf("[DNS] [%s] Record updated", meta.Name)
 
-			// Add the record to the cache
-			existingRecords[meta.Annotations["greydns.io/domain"]] = *dnsRecord
+			// Update the cache - remove old key, add new key if different
+			if oldDomain != newDomain {
+				delete(existingRecords, oldDomain)
+			}
+			existingRecords[newDomain] = dnsRecord
 		}
 	}
 }
 
 func HandleDeletions(
-	existingRecords map[string]dns.RecordResponse,
+	provider types.Provider,
+	existingRecords map[string]*types.DNSRecord,
 	zonesToNames map[string]string,
 	service *v1.Service,
 ) {
@@ -173,35 +203,34 @@ func HandleDeletions(
 
 	// Check if the zone exists
 	log.Debug().Msgf("[DNS] [%s] Checking if zone exists", meta.Name)
-	zone, err := cf.CheckIfZoneExists(zonesToNames, meta.Annotations["greydns.io/zone"])
+	zone, err := provider.CheckZoneExists(meta.Annotations["greydns.io/zone"], zonesToNames)
 	if err != nil {
 		log.Error().Err(err).Msgf("[DNS] [%s] Zone does not exist", meta.Name)
 		return
 	}
 
 	// Check if the record exists
+	domain := meta.Annotations["greydns.io/domain"]
 	log.Debug().Msgf("[DNS] [%s] Checking if record exists", meta.Name)
-	record, exists := existingRecords[meta.Annotations["greydns.io/domain"]]
+	record, exists := existingRecords[domain]
 	if exists {
 		// Ensure this service is the owner of the record
-		if record.Comment != "[greydns - Do not manually edit]"+meta.Namespace+"/"+meta.Name {
+		expectedComment := "[greydns - Do not manually edit]" + meta.Namespace + "/" + meta.Name
+		if record.Comment != expectedComment {
 			log.Debug().Msgf("[DNS] [%s] Record does not belong to this service", meta.Name)
 			return
 		}
 
 		log.Info().Msgf("[DNS] [%s] Record exists, attempting to delete", meta.Name)
 
-		cfErr := cf.DeleteRecord(
-			record.ID,
-			zone.ID,
-		)
-		if cfErr != nil {
-			log.Error().Err(cfErr).Msgf("[DNS] [%s] Failed to delete record", meta.Name)
+		deleteErr := provider.DeleteRecord(record.ID, zone.ID)
+		if deleteErr != nil {
+			log.Error().Err(deleteErr).Msgf("[DNS] [%s] Failed to delete record", meta.Name)
 		} else {
 			log.Info().Msgf("[DNS] [%s] Record deleted", meta.Name)
 
 			// Remove the record from the cache
-			delete(existingRecords, meta.Annotations["greydns.io/domain"])
+			delete(existingRecords, domain)
 		}
 	} else {
 		log.Debug().Msgf("[DNS] [%s] Record does not exist", meta.Name)
