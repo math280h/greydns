@@ -10,6 +10,8 @@ on:
       - 'deployment.yaml'
       - 'Dockerfile'
       - '.github/workflows/integration.yml'
+      - 'go.mod'
+      - 'go.sum'
   workflow_dispatch: # Allow manual trigger
 
 env:
