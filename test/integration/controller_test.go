@@ -32,7 +32,7 @@ func TestIntegration_CloudflareProvider(t *testing.T) {
 	zoneName := os.Getenv("CLOUDFLARE_ZONE_NAME")
 
 	if apiToken == "" || zoneID == "" || zoneName == "" {
-		t.Skip("CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE_ID, and CLOUDFLARE_ZONE_NAME must be set for integration tests")
+		t.Fatal("CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE_ID, and CLOUDFLARE_ZONE_NAME must be set for integration tests")
 	}
 
 	// Initialize ConfigMap for provider to use
@@ -132,7 +132,7 @@ func TestIntegration_GCPProvider(t *testing.T) {
 	managedZoneID := os.Getenv("GCP_MANAGED_ZONE_ID")
 
 	if projectID == "" || serviceAccount == "" || zoneName == "" || managedZoneID == "" {
-		t.Skip("GCP_PROJECT_ID, GCP_SERVICE_ACCOUNT_JSON, GCP_ZONE_NAME, and GCP_MANAGED_ZONE_ID must be set for integration tests")
+		t.Fatal("GCP_PROJECT_ID, GCP_SERVICE_ACCOUNT_JSON, GCP_ZONE_NAME, and GCP_MANAGED_ZONE_ID must be set for integration tests")
 	}
 
 	// Initialize ConfigMap for provider to use
