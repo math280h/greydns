@@ -61,10 +61,19 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+
     - name: Run Trivy vulnerability scanner
       uses: aquasecurity/trivy-action@master
       with:
-        image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}'
+        image-ref: '${{ fromJSON(steps.meta.outputs.json).tags[0] }}'
         format: 'sarif'
         output: 'trivy-results.sarif'
 
