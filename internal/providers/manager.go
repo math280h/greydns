@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	cfprovider "github.com/math280h/greydns/internal/providers/cf"
+	gcpprovider "github.com/math280h/greydns/internal/providers/gcp"
 	"github.com/math280h/greydns/internal/types"
 )
 
@@ -19,6 +20,8 @@ func NewManager(providerName string) (*Manager, error) {
 	switch providerName {
 	case "cloudflare":
 		provider = &cfprovider.Provider{}
+	case "gcp", "google":
+		provider = &gcpprovider.Provider{}
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", providerName)
 	}

@@ -23,6 +23,7 @@ GreyDNS uses a modular provider architecture that makes it easy to support multi
 ### Currently Supported
 
 - **CloudFlare**: Full support with proxy features, A/CNAME records, and automatic cleanup
+- **Google Cloud DNS**: Full support with A/CNAME/AAAA/TXT records, managed zones, and automatic cleanup
 
 ### Provider Configuration
 
@@ -35,12 +36,12 @@ metadata:
   name: greydns-config
   namespace: default
 data:
-  provider: "cloudflare"  # Specify your DNS provider
+  provider: "cloudflare"  # Options: "cloudflare", "gcp", "google"
   record-ttl: "60"
   record-type: "A"
   cache-refresh-seconds: "60"
   ingress-destination: "YOUR_INGRESS_IP"
-  proxy-enabled: "true"
+  proxy-enabled: "true"  # CloudFlare only
 ```
 
 If no `provider` is specified, it defaults to CloudFlare for backward compatibility.
@@ -63,6 +64,37 @@ kubectl create secret generic greydns-secret \
   --from-literal=cloudflare=YOUR_API_TOKEN
 ```
 
+### Google Cloud DNS Setup
+
+- GCP project with Cloud DNS API enabled
+- Service account with the following IAM role:
+  - `roles/dns.admin` (DNS Administrator)
+
+Create a service account and download the JSON key:
+
+```sh
+# Create service account
+gcloud iam service-accounts create greydns-sa \
+  --display-name="GreyDNS Service Account"
+
+# Grant DNS admin role
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
+  --member="serviceAccount:greydns-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/dns.admin"
+
+# Create and download key
+gcloud iam service-accounts keys create ~/greydns-key.json \
+  --iam-account=greydns-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com
+```
+
+Create the GCP credentials secret:
+
+```sh
+kubectl create secret generic greydns-secret \
+  --from-literal=gcp-project-id=YOUR_PROJECT_ID \
+  --from-file=gcp-service-account=~/greydns-key.json
+```
+
 ## 🛠️ Installation
 
 1. Deploy GreyDNS using kubectl:
@@ -80,19 +112,27 @@ kubectl create secret generic greydns-secret \
       name: greydns-config
       namespace: default
     data:
-      provider: "cloudflare"  # DNS provider to use
+      provider: "cloudflare"  # Options: "cloudflare", "gcp", "google"
       record-ttl: "60"
       record-type: "A"
       cache-refresh-seconds: "60"
       ingress-destination: "YOUR_INGRESS_IP"
-      proxy-enabled: "true"
+      proxy-enabled: "true"  # CloudFlare only
     ```
 
-3. Create your DNS provider credentials secret (example for CloudFlare):
+3. Create your DNS provider credentials secret:
 
+    **For CloudFlare:**
     ```sh
     kubectl create secret generic greydns-secret \
       --from-literal=cloudflare=YOUR_API_TOKEN
+    ```
+
+    **For Google Cloud DNS:**
+    ```sh
+    kubectl create secret generic greydns-secret \
+      --from-literal=gcp-project-id=YOUR_PROJECT_ID \
+      --from-file=gcp-service-account=~/greydns-key.json
     ```
 
 ## 📝 Usage
@@ -107,10 +147,12 @@ metadata:
   annotations:
     greydns.io/dns: "true"
     greydns.io/domain: "api.example.com"
-    greydns.io/zone: "example.com"
+    greydns.io/zone: "example.com"  # For CloudFlare: zone name; For GCP: managed zone name
 spec:
   # ... rest of service spec
 ```
+
+**Note for GCP users:** The `greydns.io/zone` annotation should match the DNS name of your managed zone (e.g., `example.com`), not the managed zone ID.
 
 ### Duplicate Records
 

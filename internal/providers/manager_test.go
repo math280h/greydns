@@ -22,6 +22,16 @@ func TestNewManager(t *testing.T) {
 			expectError:  false,
 		},
 		{
+			name:         "valid gcp provider",
+			providerName: "gcp",
+			expectError:  false,
+		},
+		{
+			name:         "valid google provider alias",
+			providerName: "google",
+			expectError:  false,
+		},
+		{
 			name:         "unsupported provider",
 			providerName: "unsupported",
 			expectError:  true,
