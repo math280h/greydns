@@ -121,9 +121,13 @@ jobs:
         CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_INT_TEST_ZONE_ID }}
         CLOUDFLARE_ZONE_NAME: ${{ secrets.CLOUDFLARE_ZONE_NAME }}
         TEST_INGRESS_IP: ${{ secrets.TEST_INGRESS_IP }}
-        KUBECONFIG: ~/.kube/config
       run: |
         # Run integration tests with real Cloudflare provider
+        export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN}"
+        export CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID}"
+        export CLOUDFLARE_ZONE_NAME="${CLOUDFLARE_ZONE_NAME}"
+        export TEST_INGRESS_IP="${TEST_INGRESS_IP}"
+        export KUBECONFIG="${HOME}/.kube/config"
         go test -v -tags=integration -timeout=10m ./test/integration/...
 
     - name: Cleanup test records
