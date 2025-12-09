@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/math280h/greydns/internal/config"
 	"github.com/math280h/greydns/internal/providers"
 	"github.com/math280h/greydns/internal/types"
 )
@@ -32,6 +33,13 @@ func TestIntegration_CloudflareProvider(t *testing.T) {
 
 	if apiToken == "" || zoneID == "" || zoneName == "" {
 		t.Skip("CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE_ID, and CLOUDFLARE_ZONE_NAME must be set for integration tests")
+	}
+
+	// Initialize ConfigMap for provider to use
+	config.ConfigMap = &v1.ConfigMap{
+		Data: map[string]string{
+			"proxy-enabled": "false",
+		},
 	}
 
 	// Create provider manager
