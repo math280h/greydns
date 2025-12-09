@@ -59,7 +59,7 @@ func (p *Provider) GetZones() (map[string]string, error) {
 
 	ctx := context.Background()
 	zonesListCall := p.service.ManagedZones.List(p.projectID)
-	
+
 	err := zonesListCall.Pages(ctx, func(resp *dns.ManagedZonesListResponse) error {
 		for _, zone := range resp.ManagedZones {
 			// Remove trailing dot from DNS name
@@ -69,7 +69,7 @@ func (p *Provider) GetZones() (map[string]string, error) {
 		}
 		return nil
 	})
-	
+
 	if err != nil {
 		return nil, types.NewProviderError("gcp", "Failed to get zones", err)
 	}
@@ -183,7 +183,7 @@ func (p *Provider) UpdateRecord(params types.UpdateRecordParams) (*types.DNSReco
 		Type(string(params.Type)).
 		Context(ctx).
 		Do()
-	
+
 	if err != nil {
 		return nil, types.NewProviderError("gcp", "Failed to find existing record", err)
 	}
@@ -269,7 +269,7 @@ func (p *Provider) DeleteRecord(recordID, zoneID string) error {
 		Type(recordType).
 		Context(ctx).
 		Do()
-	
+
 	if err != nil {
 		return types.NewProviderError("gcp", "Failed to find record for deletion", err)
 	}
@@ -308,7 +308,7 @@ func (p *Provider) GetRecords(zoneID string) (map[string]*types.DNSRecord, error
 	records := make(map[string]*types.DNSRecord)
 
 	rrsetsList := p.service.ResourceRecordSets.List(p.projectID, zoneID)
-	
+
 	err := rrsetsList.Pages(ctx, func(resp *dns.ResourceRecordSetsListResponse) error {
 		for _, rrset := range resp.Rrsets {
 			// Skip NS and SOA records at the zone apex
@@ -319,7 +319,7 @@ func (p *Provider) GetRecords(zoneID string) (map[string]*types.DNSRecord, error
 			// Check if this is a TXT record with our comment pattern
 			isManaged := false
 			comment := ""
-			
+
 			if rrset.Type == "TXT" {
 				for _, txtData := range rrset.Rrdatas {
 					// Remove quotes from TXT data
@@ -352,7 +352,7 @@ func (p *Provider) GetRecords(zoneID string) (map[string]*types.DNSRecord, error
 				}
 
 				records[recordName] = record
-				
+
 				if isManaged {
 					log.Debug().Msgf("[GCP Provider] Found managed record: %s (Type: %s)", recordName, rrset.Type)
 				}
@@ -379,7 +379,7 @@ func (p *Provider) GetRecords(zoneID string) (map[string]*types.DNSRecord, error
 // RefreshRecordsCache refreshes the cache of all managed DNS records
 func (p *Provider) RefreshRecordsCache(zones map[string]string) (map[string]*types.DNSRecord, error) {
 	newExistingRecords := make(map[string]*types.DNSRecord)
-	
+
 	for _, zoneID := range zones {
 		zoneRecords, err := p.GetRecords(zoneID)
 		if err != nil {
@@ -389,7 +389,7 @@ func (p *Provider) RefreshRecordsCache(zones map[string]string) (map[string]*typ
 			newExistingRecords[name] = record
 		}
 	}
-	
+
 	log.Info().Msgf("[GCP Provider] Refresh found %d records", len(newExistingRecords))
 	return newExistingRecords, nil
 }
