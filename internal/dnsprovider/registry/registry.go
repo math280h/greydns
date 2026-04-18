@@ -59,7 +59,7 @@ func (c ProviderConfig) GetBool(suffix string, defaultValue bool) bool {
 }
 
 var (
-	mu        sync.RWMutex
+	mu        sync.RWMutex           //nolint:gochecknoglobals // registry pattern
 	factories = map[string]Factory{} //nolint:gochecknoglobals // registry pattern
 )
 

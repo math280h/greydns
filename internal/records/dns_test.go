@@ -1,4 +1,4 @@
-package records
+package records_test
 
 import (
 	"context"
@@ -11,6 +11,7 @@ import (
 
 	"github.com/math280h/greydns/internal/dnsprovider"
 	"github.com/math280h/greydns/internal/dnsprovider/fake"
+	"github.com/math280h/greydns/internal/records"
 	"github.com/math280h/greydns/internal/utils"
 )
 
@@ -23,12 +24,12 @@ const (
 	testSvcName  = "api"
 )
 
-func setupTest(t *testing.T) (*Reconciler, *fake.Provider, *record.FakeRecorder) {
+func setupTest(t *testing.T) (*records.Reconciler, *fake.Provider, *record.FakeRecorder) {
 	t.Helper()
 	provider := fake.New(dnsprovider.Zone{ID: testZoneID, Name: testZoneName})
 	recorder := record.NewFakeRecorder(16)
-	utils.Recorder = recorder
-	r := &Reconciler{
+	utils.Recorder = recorder //nolint:reassign // tests stub the event recorder
+	r := &records.Reconciler{
 		Provider:           provider,
 		Cache:              make(map[string]dnsprovider.Record),
 		ZonesToNames:       map[string]string{testZoneName: testZoneID},
@@ -39,11 +40,11 @@ func setupTest(t *testing.T) (*Reconciler, *fake.Provider, *record.FakeRecorder)
 	return r, provider, recorder
 }
 
-func svc(ns, name string, annotations map[string]string) *v1.Service {
+func svc(annotations map[string]string) *v1.Service {
 	return &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace:   ns,
-			Name:        name,
+			Namespace:   testNS,
+			Name:        testSvcName,
 			Annotations: annotations,
 		},
 	}
@@ -51,16 +52,16 @@ func svc(ns, name string, annotations map[string]string) *v1.Service {
 
 func dnsAnnotations(zone, domain string) map[string]string {
 	return map[string]string{
-		AnnotationDNS:    "true",
-		AnnotationZone:   zone,
-		AnnotationDomain: domain,
+		records.AnnotationDNS:    "true",
+		records.AnnotationZone:   zone,
+		records.AnnotationDomain: domain,
 	}
 }
 
 func TestHandleAnnotations_CreatesRecord(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
-	s := svc(testNS, testSvcName, dnsAnnotations(testZoneName, testDomain))
+	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleAnnotations(context.Background(), s)
 
 	rec, ok := r.Cache[testDomain]
@@ -78,7 +79,7 @@ func TestHandleAnnotations_CreatesRecord(t *testing.T) {
 func TestHandleAnnotations_SkipsWhenDNSDisabled(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
-	s := svc(testNS, testSvcName, map[string]string{AnnotationDNS: "false"})
+	s := svc(map[string]string{records.AnnotationDNS: "false"})
 	r.HandleAnnotations(context.Background(), s)
 
 	if len(r.Cache) != 0 {
@@ -92,7 +93,7 @@ func TestHandleAnnotations_SkipsWhenDNSDisabled(t *testing.T) {
 func TestHandleAnnotations_SkipsWhenZoneMissing(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
-	s := svc(testNS, testSvcName, dnsAnnotations("unknown.com", testDomain))
+	s := svc(dnsAnnotations("unknown.com", testDomain))
 	r.HandleAnnotations(context.Background(), s)
 
 	if len(r.Cache) != 0 {
@@ -113,7 +114,7 @@ func TestHandleAnnotations_DuplicateDomainEmitsEvent(t *testing.T) {
 		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
 	}
 
-	s := svc(testNS, testSvcName, dnsAnnotations(testZoneName, testDomain))
+	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleAnnotations(context.Background(), s)
 
 	select {
@@ -139,7 +140,7 @@ func TestHandleAnnotations_CleansUpStaleOwnedRecord(t *testing.T) {
 	})
 	r.Cache["old.example.com"] = stale
 
-	s := svc(testNS, testSvcName, dnsAnnotations(testZoneName, testDomain))
+	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleAnnotations(context.Background(), s)
 
 	if _, ok := r.Cache["old.example.com"]; ok {
@@ -170,8 +171,8 @@ func TestHandleUpdates_UpdatesExisting(t *testing.T) {
 	}
 	r.Cache[testDomain] = existing
 
-	oldSvc := svc(testNS, testSvcName, dnsAnnotations(testZoneName, testDomain))
-	newSvc := svc(testNS, testSvcName, dnsAnnotations(testZoneName, "new.example.com"))
+	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
+	newSvc := svc(dnsAnnotations(testZoneName, "new.example.com"))
 
 	r.HandleUpdates(context.Background(), newSvc, oldSvc)
 
@@ -190,8 +191,8 @@ func TestHandleUpdates_UpdatesExisting(t *testing.T) {
 func TestHandleUpdates_FallsThroughWhenOldMissing(t *testing.T) {
 	r, _, _ := setupTest(t)
 
-	oldSvc := svc(testNS, testSvcName, dnsAnnotations(testZoneName, testDomain))
-	newSvc := svc(testNS, testSvcName, dnsAnnotations(testZoneName, testDomain))
+	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
+	newSvc := svc(dnsAnnotations(testZoneName, testDomain))
 
 	r.HandleUpdates(context.Background(), newSvc, oldSvc)
 
@@ -210,8 +211,8 @@ func TestHandleUpdates_RefusesToUpdateOtherServicesRecord(t *testing.T) {
 		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
 	}
 
-	oldSvc := svc(testNS, testSvcName, dnsAnnotations(testZoneName, testDomain))
-	newSvc := svc(testNS, testSvcName, dnsAnnotations(testZoneName, testDomain))
+	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
+	newSvc := svc(dnsAnnotations(testZoneName, testDomain))
 
 	r.HandleUpdates(context.Background(), newSvc, oldSvc)
 
@@ -244,7 +245,7 @@ func TestHandleDeletions_DeletesOwnedRecord(t *testing.T) {
 	}
 	r.Cache[testDomain] = existing
 
-	s := svc(testNS, testSvcName, dnsAnnotations(testZoneName, testDomain))
+	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleDeletions(context.Background(), s)
 
 	if _, ok := r.Cache[testDomain]; ok {
@@ -265,7 +266,7 @@ func TestHandleDeletions_NoopOnForeignRecord(t *testing.T) {
 	})
 	r.Cache[testDomain] = existing
 
-	s := svc(testNS, testSvcName, dnsAnnotations(testZoneName, testDomain))
+	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleDeletions(context.Background(), s)
 
 	if _, ok := r.Cache[testDomain]; !ok {

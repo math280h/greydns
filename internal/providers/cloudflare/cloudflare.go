@@ -39,7 +39,7 @@ const (
 	commentMarker = "[greydns]owner="
 )
 
-func init() {
+func init() { //nolint:gochecknoinits // required for provider self-registration
 	registry.Register(providerName, New)
 }
 

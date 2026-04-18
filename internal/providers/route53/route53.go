@@ -27,7 +27,7 @@ import (
 
 const providerName = "route53"
 
-func init() {
+func init() { //nolint:gochecknoinits // required for provider self-registration
 	registry.Register(providerName, New)
 }
 

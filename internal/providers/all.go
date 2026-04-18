@@ -9,6 +9,8 @@
 package providers
 
 import (
+	// Each provider's init() calls registry.Register; blank-imports pull
+	// them into the dependency graph.
 	_ "github.com/math280h/greydns/internal/providers/cloudflare"
 	_ "github.com/math280h/greydns/internal/providers/route53"
 )

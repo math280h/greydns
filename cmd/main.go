@@ -25,7 +25,7 @@ import (
 	"github.com/math280h/greydns/internal/utils"
 )
 
-func main() { //nolint:gocognit // controller bootstrap
+func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}) //nolint:reassign // Required for logging
 
 	restCfg, err := rest.InClusterConfig()
@@ -63,8 +63,8 @@ func main() { //nolint:gocognit // controller bootstrap
 		mustAtoi(cfg.GetRequiredConfigValue("cache-refresh-seconds"), "cache-refresh-seconds"),
 	) * time.Second
 	recordType := dnsprovider.RecordType(cfg.GetRequiredConfigValue("record-type"))
-	if err := dnsprovider.ValidateRecordType(recordType, provider.SupportedRecordTypes()); err != nil {
-		log.Fatal().Err(err).Str("provider", provider.Name()).Msg("[Core] record-type rejected by provider")
+	if typeErr := dnsprovider.ValidateRecordType(recordType, provider.SupportedRecordTypes()); typeErr != nil {
+		log.Fatal().Err(typeErr).Str("provider", provider.Name()).Msg("[Core] record-type rejected by provider")
 	}
 
 	ctx := context.Background()
@@ -171,7 +171,11 @@ func mustListZones(ctx context.Context, provider dnsprovider.Provider) map[strin
 	return out
 }
 
-func refreshCache(ctx context.Context, provider dnsprovider.Provider, zones map[string]string) map[string]dnsprovider.Record {
+func refreshCache(
+	ctx context.Context,
+	provider dnsprovider.Provider,
+	zones map[string]string,
+) map[string]dnsprovider.Record {
 	out := make(map[string]dnsprovider.Record)
 	for _, id := range zones {
 		recs, err := provider.ListOwnedRecords(ctx, id)
