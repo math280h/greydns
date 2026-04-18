@@ -18,13 +18,17 @@ GreyDNS enables development teams to manage their DNS records directly through K
 
 ## 📦 Supported DNS Providers
 
-- **CloudFlare Support**: Native integration with CloudFlare DNS
+GreyDNS uses a pluggable provider system. Exactly one provider is active at a time, selected via the `provider` key in the ConfigMap.
+
+- **CloudFlare**
 
 ### Coming Soon
 
-- **AWS Route 53 Support**: Integration with AWS Route 53
-- **Google Cloud DNS Support**: Integration with Google Cloud DNS
-- **Azure DNS Support**: Integration with Azure DNS
+- **Route 53** 
+- **Google Cloud DNS Support**
+- **Azure DNS Support**
+
+See [`docs/adding-a-provider.md`](docs/adding-a-provider.md) for how to add a new provider in a single package.
 
 ## 📋 Prerequisites
 
@@ -45,7 +49,7 @@ GreyDNS enables development teams to manage their DNS records directly through K
     kubectl apply -f https://raw.githubusercontent.com/math280h/greydns/refs/heads/main/deployment.yaml
     ```
 
-2. Create the required ConfigMap:
+2. Create the required ConfigMap. Generic keys live at the top level; provider-specific keys are namespaced by the provider name (e.g. `cloudflare.proxy-enabled`), so switching providers is purely a config change:
 
     ```yaml
     apiVersion: v1
@@ -54,18 +58,21 @@ GreyDNS enables development teams to manage their DNS records directly through K
       name: greydns-config
       namespace: default
     data:
-      record-ttl: "60"
+      provider: "cloudflare"
       record-type: "A"
+      record-ttl: "60"
       cache-refresh-seconds: "60"
       ingress-destination: "YOUR_INGRESS_IP"
-      proxy-enabled: "true"
+      # Cloudflare-specific
+      cloudflare.proxy-enabled: "true"
     ```
 
-3. Create the CloudFlare API token secret:
+3. Create the provider secret. The secret is always named `greydns-secret`; keys are provider-specific:
 
     ```sh
+    # Cloudflare
     kubectl create secret generic greydns-secret \
-    --from-literal=cloudflare=YOUR_API_TOKEN
+      --from-literal=cloudflare-token=YOUR_API_TOKEN
     ```
 
 ## 📝 Usage
@@ -95,14 +102,25 @@ GreyDNS will create an event on the service if it detects a record that is alrea
 
 ## 🔍 Configuration
 
+### Generic keys
+
+Universal DNS concepts live at the top level so they're not duplicated across providers.
+
 | Config Key | Description | Required |
-|------------|-------------|---------|
-| record-ttl | DNS record time-to-live in seconds | True |
-| record-type | DNS record type (A or CNAME) | True |
-| proxy-enabled | Enable CloudFlare proxy | True |
-| cache-refresh-seconds | Cache refresh interval | True |
-| ingress-destination | Ingress controller IP address | True |
-| proxy-enabled | Enable CloudFlare proxy | True |
+|------------|-------------|----------|
+| `provider` | Active provider name (e.g. `cloudflare`, `route53`) | Yes |
+| `record-type` | DNS record type (`A`, `CNAME`, ...) | Yes |
+| `record-ttl` | DNS record time-to-live in seconds | Yes |
+| `cache-refresh-seconds` | Cache refresh interval | Yes |
+| `ingress-destination` | Ingress controller IP address or hostname | Yes |
+
+### Cloudflare keys (`provider: cloudflare`)
+
+| Config Key | Description | Required |
+|------------|-------------|----------|
+| `cloudflare.proxy-enabled` | Enable Cloudflare proxy (`true`/`false`) | No (default `false`) |
+
+Secret keys: `cloudflare-token`.
 
 ## 🤔 Why Not ExternalDNS?
 

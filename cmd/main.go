@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cloudflare/cloudflare-go/v4/dns"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -19,27 +18,22 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	cfg "github.com/math280h/greydns/internal/config"
-	cf "github.com/math280h/greydns/internal/providers/cf"
+	"github.com/math280h/greydns/internal/dnsprovider"
+	"github.com/math280h/greydns/internal/dnsprovider/registry"
+	_ "github.com/math280h/greydns/internal/providers" // registers all DNS provider factories
 	"github.com/math280h/greydns/internal/records"
 	"github.com/math280h/greydns/internal/utils"
 )
 
-var (
-	ingressDestination string                                //nolint:gochecknoglobals // Required for ingress destination
-	zonesToNames       = make(map[string]string)             //nolint:gochecknoglobals // Required for zones
-	existingRecords    = make(map[string]dns.RecordResponse) //nolint:gochecknoglobals // Required for existing records
-)
-
-func main() { //nolint:gocognit // Required for main function
+func main() { //nolint:gocognit // controller bootstrap
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}) //nolint:reassign // Required for logging
 
-	// Create Kubernetes client
-	config, err := rest.InClusterConfig()
+	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		log.Fatal().Err(err).Msg("[Core] Failed to get cluster config")
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("[Core] Failed to create clientset")
 	}
@@ -51,36 +45,51 @@ func main() { //nolint:gocognit // Required for main function
 		log.Fatal().Err(err).Msg("[Core] Failed to get secret")
 	}
 
-	ingressDestination = cfg.GetRequiredConfigValue("ingress-destination")
+	utils.StartBroadcaster(clientset)
 
-	utils.StartBroadcaster(
-		clientset,
+	providerName := cfg.ProviderName()
+	provider, err := registry.Build(
+		providerName,
+		registry.NewProviderConfig(providerName, cfg.Data()),
+		secret.Data,
 	)
+	if err != nil {
+		log.Fatal().Err(err).Str("provider", providerName).Msg("[Core] Failed to build provider")
+	}
+	log.Info().Str("provider", provider.Name()).Msg("[Core] DNS provider ready")
 
-	// TODO:: Support multiple providers
-	cf.Connect(secret)
-	zonesToNames = cf.GetZoneNames()
-	existingRecords = cf.RefreshRecordsCache(
-		zonesToNames,
-	)
+	ttl := mustAtoi(cfg.GetRequiredConfigValue("record-ttl"), "record-ttl")
+	refreshInterval := time.Duration(
+		mustAtoi(cfg.GetRequiredConfigValue("cache-refresh-seconds"), "cache-refresh-seconds"),
+	) * time.Second
+	recordType := dnsprovider.RecordType(cfg.GetRequiredConfigValue("record-type"))
+	if err := dnsprovider.ValidateRecordType(recordType, provider.SupportedRecordTypes()); err != nil {
+		log.Fatal().Err(err).Str("provider", provider.Name()).Msg("[Core] record-type rejected by provider")
+	}
+
+	ctx := context.Background()
+	zonesToNames := mustListZones(ctx, provider)
+
+	reconciler := &records.Reconciler{
+		Provider:           provider,
+		Cache:              refreshCache(ctx, provider, zonesToNames),
+		ZonesToNames:       zonesToNames,
+		IngressDestination: cfg.GetRequiredConfigValue("ingress-destination"),
+		RecordTTL:          ttl,
+		RecordType:         recordType,
+	}
+
 	go func() {
-		for {
-			sleepTime, strconvErr := strconv.ParseInt(cfg.GetRequiredConfigValue("cache-refresh-seconds"), 0, 64)
-			if strconvErr != nil {
-				log.Fatal().Err(strconvErr).Msg("[Core] Sleep time is not a valid integer")
-			}
-			time.Sleep(time.Duration(sleepTime) * time.Second)
-			existingRecords = cf.RefreshRecordsCache(
-				zonesToNames,
-			)
+		ticker := time.NewTicker(refreshInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			reconciler.Cache = refreshCache(ctx, provider, zonesToNames)
 		}
 	}()
 
-	// Set up informer to watch Service resources
 	factory := informers.NewSharedInformerFactory(clientset, 30*time.Second)
 	serviceInformer := factory.Core().V1().Services().Informer()
 
-	// Define event handlers
 	_, err = serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			service, ok := obj.(*v1.Service)
@@ -88,12 +97,7 @@ func main() { //nolint:gocognit // Required for main function
 				log.Error().Msg("[Core] Failed to cast object")
 				return
 			}
-			records.HandleAnnotations(
-				existingRecords,
-				ingressDestination,
-				zonesToNames,
-				service,
-			)
+			reconciler.HandleAnnotations(ctx, service)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			service, ok := newObj.(*v1.Service)
@@ -101,34 +105,16 @@ func main() { //nolint:gocognit // Required for main function
 				log.Error().Msg("[Core] Failed to cast object during update")
 				return
 			}
-
 			oldService, ok := oldObj.(*v1.Service)
 			if !ok {
 				log.Error().Msg("[Core] Failed to cast old object during update")
 				return
 			}
-
-			annotationsChanged := false
-			for key, value := range service.Annotations {
-				if !strings.Contains(key, "greydns.io") {
-					continue
-				}
-				if value != oldService.Annotations[key] {
-					annotationsChanged = true
-					break
-				}
+			if !greydnsAnnotationsChanged(service, oldService) {
+				return
 			}
-
-			if annotationsChanged {
-				log.Info().Msgf("[Core] [%s] Annotations changed, updating records", service.Name)
-				records.HandleUpdates(
-					existingRecords,
-					ingressDestination,
-					zonesToNames,
-					service,
-					oldService,
-				)
-			}
+			log.Info().Msgf("[Core] [%s] Annotations changed, updating records", service.Name)
+			reconciler.HandleUpdates(ctx, service, oldService)
 		},
 		DeleteFunc: func(obj interface{}) {
 			service, ok := obj.(*v1.Service)
@@ -136,11 +122,7 @@ func main() { //nolint:gocognit // Required for main function
 				log.Error().Msg("[Core] Failed to cast object during delete")
 				return
 			}
-			records.HandleDeletions(
-				existingRecords,
-				zonesToNames,
-				service,
-			)
+			reconciler.HandleDeletions(ctx, service)
 		},
 	})
 	if err != nil {
@@ -148,11 +130,60 @@ func main() { //nolint:gocognit // Required for main function
 		return
 	}
 
-	// Start the informer
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	factory.Start(stopCh)
 
-	// Keep running
 	select {}
+}
+
+func greydnsAnnotationsChanged(service, oldService *v1.Service) bool {
+	for key, value := range service.Annotations {
+		if !strings.HasPrefix(key, "greydns.io/") {
+			continue
+		}
+		if value != oldService.Annotations[key] {
+			return true
+		}
+	}
+	return false
+}
+
+func mustAtoi(raw, name string) int {
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Fatal().Err(err).Str("key", name).Msg("[Core] Config value is not a valid integer")
+	}
+	return v
+}
+
+func mustListZones(ctx context.Context, provider dnsprovider.Provider) map[string]string {
+	zones, err := provider.ListZones(ctx)
+	if err != nil {
+		log.Fatal().Err(err).Msg("[Core] Failed to list zones")
+	}
+	out := make(map[string]string, len(zones))
+	for _, z := range zones {
+		out[z.Name] = z.ID
+		log.Debug().Msgf("[Core] Found zone: %s (ID: %s)", z.Name, z.ID)
+	}
+	log.Info().Msgf("[Core] Found %d zones", len(out))
+	return out
+}
+
+func refreshCache(ctx context.Context, provider dnsprovider.Provider, zones map[string]string) map[string]dnsprovider.Record {
+	out := make(map[string]dnsprovider.Record)
+	for _, id := range zones {
+		recs, err := provider.ListOwnedRecords(ctx, id)
+		if err != nil {
+			log.Error().Err(err).Str("zone", id).Msg("[Core] Failed to list records")
+			continue
+		}
+		for _, r := range recs {
+			out[r.Name] = r
+			log.Debug().Msgf("[Core] Refresh found record: %s (ID: %s)", r.Name, r.ID)
+		}
+	}
+	log.Info().Msgf("[Core] Refresh found %d records", len(out))
+	return out
 }
