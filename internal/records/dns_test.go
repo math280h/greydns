@@ -276,3 +276,157 @@ func TestHandleDeletions_NoopOnForeignRecord(t *testing.T) {
 		t.Fatal("foreign record should remain in provider")
 	}
 }
+
+func TestHandleDeletions_WorksWhenDNSDisabled(t *testing.T) {
+	// Regression: a Service that gets DNS turned off before deletion
+	// should still have its record cleaned up on delete, not leaked.
+	r, provider, _ := setupTest(t)
+
+	existing, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Type:     dnsprovider.RecordTypeA,
+		Content:  testIngress,
+		TTL:      60,
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+	r.Cache[testDomain] = existing
+
+	s := svc(map[string]string{records.AnnotationDNS: "false"})
+	r.HandleDeletions(context.Background(), s)
+
+	if _, ok := r.Cache[testDomain]; ok {
+		t.Fatal("record should be removed from cache")
+	}
+	if len(provider.Snapshot()) != 0 {
+		t.Fatal("record should be removed from provider")
+	}
+}
+
+func TestHandleDeletions_WorksWhenAnnotationsMissing(t *testing.T) {
+	// Regression: HandleDeletions must not depend on annotations to
+	// locate owned records.
+	r, provider, _ := setupTest(t)
+
+	existing, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Type:     dnsprovider.RecordTypeA,
+		Content:  testIngress,
+		TTL:      60,
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+	r.Cache[testDomain] = existing
+
+	s := svc(nil)
+	r.HandleDeletions(context.Background(), s)
+
+	if len(provider.Snapshot()) != 0 {
+		t.Fatal("record should be removed from provider")
+	}
+}
+
+func TestHandleAnnotations_EmptyDomainEmitsEvent(t *testing.T) {
+	r, provider, recorder := setupTest(t)
+
+	s := svc(map[string]string{
+		records.AnnotationDNS:  "true",
+		records.AnnotationZone: testZoneName,
+		// no domain
+	})
+	r.HandleAnnotations(context.Background(), s)
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "InvalidAnnotation") {
+			t.Fatalf("want InvalidAnnotation event, got %q", ev)
+		}
+	default:
+		t.Fatal("expected InvalidAnnotation event")
+	}
+	if len(provider.Snapshot()) != 0 {
+		t.Fatal("provider should not have been called")
+	}
+}
+
+func TestHandleAnnotations_EmptyZoneEmitsEvent(t *testing.T) {
+	r, provider, recorder := setupTest(t)
+
+	s := svc(map[string]string{
+		records.AnnotationDNS:    "true",
+		records.AnnotationDomain: testDomain,
+		// no zone
+	})
+	r.HandleAnnotations(context.Background(), s)
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "InvalidAnnotation") {
+			t.Fatalf("want InvalidAnnotation event, got %q", ev)
+		}
+	default:
+		t.Fatal("expected InvalidAnnotation event")
+	}
+	if len(provider.Snapshot()) != 0 {
+		t.Fatal("provider should not have been called")
+	}
+}
+
+func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
+	// Regression: a Service that changes greydns.io/zone must have its
+	// record moved from the old zone to the new zone, not updated
+	// in-place (record IDs are zone-scoped).
+	const otherZoneID, otherZoneName = "zone-id-2", "other.example"
+	provider := fake.New(
+		dnsprovider.Zone{ID: testZoneID, Name: testZoneName},
+		dnsprovider.Zone{ID: otherZoneID, Name: otherZoneName},
+	)
+	utils.Recorder = record.NewFakeRecorder(16) //nolint:reassign // tests stub the event recorder
+	r := &records.Reconciler{
+		Provider:           provider,
+		Cache:              make(map[string]dnsprovider.Record),
+		ZonesToNames:       map[string]string{testZoneName: testZoneID, otherZoneName: otherZoneID},
+		IngressDestination: testIngress,
+		RecordTTL:          60,
+		RecordType:         dnsprovider.RecordTypeA,
+	}
+
+	existing, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Type:     dnsprovider.RecordTypeA,
+		Content:  testIngress,
+		TTL:      60,
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+	r.Cache[testDomain] = existing
+
+	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
+	newSvc := svc(dnsAnnotations(otherZoneName, testDomain))
+
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	snap := provider.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("expected exactly 1 record after migration, got %d", len(snap))
+	}
+	if snap[0].ZoneID != otherZoneID {
+		t.Fatalf("expected record to live in %q, got %q", otherZoneID, snap[0].ZoneID)
+	}
+	cached, ok := r.Cache[testDomain]
+	if !ok {
+		t.Fatal("migrated record should still be in cache")
+	}
+	if cached.ZoneID != otherZoneID {
+		t.Fatalf("cached record zone = %q, want %q", cached.ZoneID, otherZoneID)
+	}
+}

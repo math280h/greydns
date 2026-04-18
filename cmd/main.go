@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -83,7 +82,7 @@ func main() {
 		ticker := time.NewTicker(refreshInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			reconciler.Cache = refreshCache(ctx, provider, zonesToNames)
+			reconciler.ReplaceCache(refreshCache(ctx, provider, zonesToNames))
 		}
 	}()
 
@@ -137,12 +136,12 @@ func main() {
 	select {}
 }
 
+// greydnsAnnotationsChanged returns true when any greydns.io/* key
+// differs between the two Services, including additions (present only
+// on new) and removals (present only on old).
 func greydnsAnnotationsChanged(service, oldService *v1.Service) bool {
-	for key, value := range service.Annotations {
-		if !strings.HasPrefix(key, "greydns.io/") {
-			continue
-		}
-		if value != oldService.Annotations[key] {
+	for _, key := range records.AnnotationKeys {
+		if service.Annotations[key] != oldService.Annotations[key] {
 			return true
 		}
 	}
