@@ -58,7 +58,7 @@ Every managed record carries `Record.OwnerRef` in the form `<namespace>/<service
 
 ## 3. Configuration
 
-Generic DNS concepts (`record-type`, `record-ttl`, `ingress-destination`) live at the top level of the ConfigMap and are read by the controller, not your provider. Your provider only needs to namespace keys that are genuinely specific to it (Cloudflare's `proxy-enabled`, Route53's `hosted-zone-id`, etc.).
+Generic DNS concepts (`record-type`, `record-ttl`, `ingress-destination`) live at the top level of the ConfigMap and are read by the controller, not your provider. Your provider only needs to namespace keys that are genuinely specific to it (e.g. Cloudflare's `proxy-enabled`).
 
 Namespace those keys under your provider name (`myprovider.foo`). The `registry.ProviderConfig` helpers do this for you:
 

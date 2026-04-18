@@ -24,19 +24,28 @@ const (
 	testSvcName  = "api"
 )
 
+func stubRecorder(t *testing.T) *record.FakeRecorder {
+	t.Helper()
+	recorder := record.NewFakeRecorder(16)
+	prev := utils.Recorder
+	utils.Recorder = recorder //nolint:reassign // tests stub the event recorder
+	t.Cleanup(func() {
+		utils.Recorder = prev //nolint:reassign // restore the production recorder after the test
+	})
+	return recorder
+}
+
 func setupTest(t *testing.T) (*records.Reconciler, *fake.Provider, *record.FakeRecorder) {
 	t.Helper()
 	provider := fake.New(dnsprovider.Zone{ID: testZoneID, Name: testZoneName})
-	recorder := record.NewFakeRecorder(16)
-	utils.Recorder = recorder //nolint:reassign // tests stub the event recorder
-	r := &records.Reconciler{
-		Provider:           provider,
-		Cache:              make(map[string]dnsprovider.Record),
-		ZonesToNames:       map[string]string{testZoneName: testZoneID},
-		IngressDestination: testIngress,
-		RecordTTL:          60,
-		RecordType:         dnsprovider.RecordTypeA,
-	}
+	recorder := stubRecorder(t)
+	r := records.NewReconciler(
+		provider,
+		map[string]string{testZoneName: testZoneID},
+		testIngress,
+		60,
+		dnsprovider.RecordTypeA,
+	)
 	return r, provider, recorder
 }
 
@@ -64,7 +73,7 @@ func TestHandleAnnotations_CreatesRecord(t *testing.T) {
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleAnnotations(context.Background(), s)
 
-	rec, ok := r.Cache[testDomain]
+	rec, ok := r.CacheRecord(testDomain)
 	if !ok {
 		t.Fatal("expected record in cache after create")
 	}
@@ -82,8 +91,8 @@ func TestHandleAnnotations_SkipsWhenDNSDisabled(t *testing.T) {
 	s := svc(map[string]string{records.AnnotationDNS: "false"})
 	r.HandleAnnotations(context.Background(), s)
 
-	if len(r.Cache) != 0 {
-		t.Fatalf("cache should be empty, has %d", len(r.Cache))
+	if r.CacheLen() != 0 {
+		t.Fatalf("cache should be empty, has %d", r.CacheLen())
 	}
 	if len(provider.Snapshot()) != 0 {
 		t.Fatalf("provider should be empty, has %d", len(provider.Snapshot()))
@@ -96,8 +105,8 @@ func TestHandleAnnotations_SkipsWhenZoneMissing(t *testing.T) {
 	s := svc(dnsAnnotations("unknown.com", testDomain))
 	r.HandleAnnotations(context.Background(), s)
 
-	if len(r.Cache) != 0 {
-		t.Fatalf("cache should be empty, has %d", len(r.Cache))
+	if r.CacheLen() != 0 {
+		t.Fatalf("cache should be empty, has %d", r.CacheLen())
 	}
 	if len(provider.Snapshot()) != 0 {
 		t.Fatalf("provider should be empty, has %d", len(provider.Snapshot()))
@@ -107,12 +116,12 @@ func TestHandleAnnotations_SkipsWhenZoneMissing(t *testing.T) {
 func TestHandleAnnotations_DuplicateDomainEmitsEvent(t *testing.T) {
 	r, provider, recorder := setupTest(t)
 
-	r.Cache[testDomain] = dnsprovider.Record{
+	r.SeedCache(testDomain, dnsprovider.Record{
 		ID:       "existing",
 		ZoneID:   testZoneID,
 		Name:     testDomain,
 		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
-	}
+	})
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleAnnotations(context.Background(), s)
@@ -138,15 +147,15 @@ func TestHandleAnnotations_CleansUpStaleOwnedRecord(t *testing.T) {
 		Name:     "old.example.com",
 		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
 	})
-	r.Cache["old.example.com"] = stale
+	r.SeedCache("old.example.com", stale)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleAnnotations(context.Background(), s)
 
-	if _, ok := r.Cache["old.example.com"]; ok {
+	if _, ok := r.CacheRecord("old.example.com"); ok {
 		t.Fatal("stale record should have been removed from cache")
 	}
-	if _, ok := r.Cache[testDomain]; !ok {
+	if _, ok := r.CacheRecord(testDomain); !ok {
 		t.Fatal("new record should be in cache")
 	}
 	snap := provider.Snapshot()
@@ -169,17 +178,17 @@ func TestHandleUpdates_UpdatesExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
-	r.Cache[testDomain] = existing
+	r.SeedCache(testDomain, existing)
 
 	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(testZoneName, "new.example.com"))
 
 	r.HandleUpdates(context.Background(), newSvc, oldSvc)
 
-	if _, ok := r.Cache[testDomain]; ok {
+	if _, ok := r.CacheRecord(testDomain); ok {
 		t.Fatal("old domain should be removed from cache")
 	}
-	updated, ok := r.Cache["new.example.com"]
+	updated, ok := r.CacheRecord("new.example.com")
 	if !ok {
 		t.Fatal("new domain should be in cache")
 	}
@@ -196,7 +205,7 @@ func TestHandleUpdates_FallsThroughWhenOldMissing(t *testing.T) {
 
 	r.HandleUpdates(context.Background(), newSvc, oldSvc)
 
-	if _, ok := r.Cache[testDomain]; !ok {
+	if _, ok := r.CacheRecord(testDomain); !ok {
 		t.Fatal("expected fresh record to be created via fall-through")
 	}
 }
@@ -204,12 +213,12 @@ func TestHandleUpdates_FallsThroughWhenOldMissing(t *testing.T) {
 func TestHandleUpdates_RefusesToUpdateOtherServicesRecord(t *testing.T) {
 	r, provider, recorder := setupTest(t)
 
-	r.Cache[testDomain] = dnsprovider.Record{
+	r.SeedCache(testDomain, dnsprovider.Record{
 		ID:       "other-id",
 		ZoneID:   testZoneID,
 		Name:     testDomain,
 		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
-	}
+	})
 
 	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(testZoneName, testDomain))
@@ -243,12 +252,12 @@ func TestHandleDeletions_DeletesOwnedRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
-	r.Cache[testDomain] = existing
+	r.SeedCache(testDomain, existing)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleDeletions(context.Background(), s)
 
-	if _, ok := r.Cache[testDomain]; ok {
+	if _, ok := r.CacheRecord(testDomain); ok {
 		t.Fatal("record should be removed from cache")
 	}
 	if len(provider.Snapshot()) != 0 {
@@ -264,12 +273,12 @@ func TestHandleDeletions_NoopOnForeignRecord(t *testing.T) {
 		Name:     testDomain,
 		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
 	})
-	r.Cache[testDomain] = existing
+	r.SeedCache(testDomain, existing)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleDeletions(context.Background(), s)
 
-	if _, ok := r.Cache[testDomain]; !ok {
+	if _, ok := r.CacheRecord(testDomain); !ok {
 		t.Fatal("foreign record should remain in cache")
 	}
 	if len(provider.Snapshot()) != 1 {
@@ -293,12 +302,12 @@ func TestHandleDeletions_WorksWhenDNSDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
-	r.Cache[testDomain] = existing
+	r.SeedCache(testDomain, existing)
 
 	s := svc(map[string]string{records.AnnotationDNS: "false"})
 	r.HandleDeletions(context.Background(), s)
 
-	if _, ok := r.Cache[testDomain]; ok {
+	if _, ok := r.CacheRecord(testDomain); ok {
 		t.Fatal("record should be removed from cache")
 	}
 	if len(provider.Snapshot()) != 0 {
@@ -322,7 +331,7 @@ func TestHandleDeletions_WorksWhenAnnotationsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
-	r.Cache[testDomain] = existing
+	r.SeedCache(testDomain, existing)
 
 	s := svc(nil)
 	r.HandleDeletions(context.Background(), s)
@@ -338,7 +347,6 @@ func TestHandleAnnotations_EmptyDomainEmitsEvent(t *testing.T) {
 	s := svc(map[string]string{
 		records.AnnotationDNS:  "true",
 		records.AnnotationZone: testZoneName,
-		// no domain
 	})
 	r.HandleAnnotations(context.Background(), s)
 
@@ -361,7 +369,6 @@ func TestHandleAnnotations_EmptyZoneEmitsEvent(t *testing.T) {
 	s := svc(map[string]string{
 		records.AnnotationDNS:    "true",
 		records.AnnotationDomain: testDomain,
-		// no zone
 	})
 	r.HandleAnnotations(context.Background(), s)
 
@@ -381,21 +388,22 @@ func TestHandleAnnotations_EmptyZoneEmitsEvent(t *testing.T) {
 func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
 	// Regression: a Service that changes greydns.io/zone must have its
 	// record moved from the old zone to the new zone, not updated
-	// in-place (record IDs are zone-scoped).
+	// in-place (record IDs are zone-scoped). The new record is created
+	// before the old one is deleted so a create failure does not leave
+	// the service without DNS.
 	const otherZoneID, otherZoneName = "zone-id-2", "other.example"
 	provider := fake.New(
 		dnsprovider.Zone{ID: testZoneID, Name: testZoneName},
 		dnsprovider.Zone{ID: otherZoneID, Name: otherZoneName},
 	)
-	utils.Recorder = record.NewFakeRecorder(16) //nolint:reassign // tests stub the event recorder
-	r := &records.Reconciler{
-		Provider:           provider,
-		Cache:              make(map[string]dnsprovider.Record),
-		ZonesToNames:       map[string]string{testZoneName: testZoneID, otherZoneName: otherZoneID},
-		IngressDestination: testIngress,
-		RecordTTL:          60,
-		RecordType:         dnsprovider.RecordTypeA,
-	}
+	stubRecorder(t)
+	r := records.NewReconciler(
+		provider,
+		map[string]string{testZoneName: testZoneID, otherZoneName: otherZoneID},
+		testIngress,
+		60,
+		dnsprovider.RecordTypeA,
+	)
 
 	existing, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
 		ZoneID:   testZoneID,
@@ -408,7 +416,7 @@ func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
-	r.Cache[testDomain] = existing
+	r.SeedCache(testDomain, existing)
 
 	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(otherZoneName, testDomain))
@@ -422,7 +430,7 @@ func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
 	if snap[0].ZoneID != otherZoneID {
 		t.Fatalf("expected record to live in %q, got %q", otherZoneID, snap[0].ZoneID)
 	}
-	cached, ok := r.Cache[testDomain]
+	cached, ok := r.CacheRecord(testDomain)
 	if !ok {
 		t.Fatal("migrated record should still be in cache")
 	}

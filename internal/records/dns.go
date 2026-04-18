@@ -21,8 +21,8 @@ const (
 )
 
 // AnnotationKeys is the exhaustive set of greydns.io/* annotations the
-// controller reacts to. Used by callers (e.g. the informer's update
-// filter) to detect additions, removals and changes in either direction.
+// controller reacts to. Callers (e.g. the informer's update filter) use
+// this to detect additions, removals and changes in either direction.
 //
 //nolint:gochecknoglobals // immutable shared data
 var AnnotationKeys = []string{AnnotationDNS, AnnotationZone, AnnotationDomain}
@@ -31,55 +31,98 @@ var AnnotationKeys = []string{AnnotationDNS, AnnotationZone, AnnotationDomain}
 // settings that are fixed at startup. Informer callbacks invoke its
 // HandleAnnotations / HandleUpdates / HandleDeletions methods.
 //
-// Cache is guarded by mu: background refresh goroutine replaces it
-// wholesale while informer handlers concurrently read/write entries.
+// The record cache is guarded by mu; the background refresh goroutine
+// replaces it wholesale while informer handlers concurrently read/write
+// entries. External callers must go through ReplaceCache / SeedCache /
+// CacheRecord / CacheLen rather than touching the map directly.
 type Reconciler struct {
 	Provider           dnsprovider.Provider
-	Cache              map[string]dnsprovider.Record
-	ZonesToNames       map[string]string
+	ZoneNameToID       map[string]string
 	IngressDestination string
 	RecordTTL          int
 	RecordType         dnsprovider.RecordType
 
-	mu sync.Mutex
+	mu    sync.Mutex
+	cache map[string]dnsprovider.Record
+}
+
+// NewReconciler returns a Reconciler with its cache initialised. Zero
+// Reconciler values won't work: the internal map needs to exist before
+// the first cache touch.
+func NewReconciler(
+	provider dnsprovider.Provider,
+	zoneNameToID map[string]string,
+	ingressDestination string,
+	recordTTL int,
+	recordType dnsprovider.RecordType,
+) *Reconciler {
+	return &Reconciler{
+		Provider:           provider,
+		ZoneNameToID:       zoneNameToID,
+		IngressDestination: ingressDestination,
+		RecordTTL:          recordTTL,
+		RecordType:         recordType,
+		cache:              make(map[string]dnsprovider.Record),
+	}
 }
 
 // ReplaceCache atomically swaps the cache contents. Used by the
-// background refresh goroutine.
+// background refresh goroutine after a successful full refresh.
 func (r *Reconciler) ReplaceCache(next map[string]dnsprovider.Record) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.Cache = next
+	r.cache = next
+}
+
+// SeedCache inserts a record into the cache. Intended for tests and
+// initial bootstrapping; informer handlers use the unexported setter.
+func (r *Reconciler) SeedCache(name string, rec dnsprovider.Record) {
+	r.cacheSet(name, rec)
+}
+
+// CacheRecord looks up a cached record by name.
+func (r *Reconciler) CacheRecord(name string) (dnsprovider.Record, bool) {
+	return r.cacheGet(name)
+}
+
+// CacheLen returns the number of cached records.
+func (r *Reconciler) CacheLen() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.cache)
 }
 
 func (r *Reconciler) cacheGet(name string) (dnsprovider.Record, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rec, ok := r.Cache[name]
+	rec, ok := r.cache[name]
 	return rec, ok
 }
 
 func (r *Reconciler) cacheSet(name string, rec dnsprovider.Record) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.Cache[name] = rec
+	if r.cache == nil {
+		r.cache = make(map[string]dnsprovider.Record)
+	}
+	r.cache[name] = rec
 }
 
 func (r *Reconciler) cacheDelete(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.Cache, name)
+	delete(r.cache, name)
 }
 
 // cacheOwnedBy returns a snapshot of every cached record whose OwnerRef
-// matches (namespace, name). The snapshot is safe to iterate and mutate
-// the cache from.
+// matches (namespace, name). The snapshot is safe to iterate while
+// mutating the cache from the same goroutine.
 func (r *Reconciler) cacheOwnedBy(namespace, name string) []dnsprovider.Record {
 	owner := dnsprovider.OwnerRefFor(namespace, name)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make([]dnsprovider.Record, 0)
-	for _, rec := range r.Cache {
+	for _, rec := range r.cache {
 		if rec.OwnerRef == owner {
 			out = append(out, rec)
 		}
@@ -97,8 +140,7 @@ func ownedBy(rec dnsprovider.Record, service *v1.Service) bool {
 
 // preflight validates the greydns annotations on service and resolves
 // its zone. Returns (zoneID, domain, true) on success, or ("", "",
-// false) to indicate the handler should no-op (with any relevant
-// warning logged or event emitted).
+// false) to indicate the handler should no-op.
 func (r *Reconciler) preflight(service *v1.Service) (string, string, bool) {
 	if !dnsEnabled(service) {
 		return "", "", false
@@ -110,7 +152,7 @@ func (r *Reconciler) preflight(service *v1.Service) (string, string, bool) {
 		emitInvalidAnnotation(service, "greydns.io/zone is empty")
 		return "", "", false
 	}
-	zoneID, ok := r.ZonesToNames[zoneName]
+	zoneID, ok := r.ZoneNameToID[zoneName]
 	if !ok {
 		log.Error().Msgf("[DNS] [%s] Zone %q not managed by provider", service.Name, zoneName)
 		return "", "", false
@@ -199,17 +241,33 @@ func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.
 
 	// Zone change: the existing record lives in existing.ZoneID, which
 	// may not equal the zoneID we just resolved from the new annotation.
-	// Record IDs are zone-scoped, so an in-place update would target the
-	// wrong zone. Delete in old zone then let HandleAnnotations create
-	// the new record in the new zone.
+	// Record IDs are zone-scoped, so an in-place update would target
+	// the wrong zone. Create the replacement in the new zone first;
+	// only delete the old-zone record once the new one is confirmed,
+	// so a create failure leaves the service still resolving.
 	if existing.ZoneID != zoneID {
 		log.Info().Msgf("[DNS] [%s] Zone changed, migrating record", service.Name)
-		if err := r.Provider.DeleteRecord(ctx, existing.ZoneID, existing.ID); err != nil {
-			log.Error().Err(err).Msgf("[DNS] [%s] Failed to delete record in old zone", service.Name)
+		created, createErr := r.Provider.CreateRecord(ctx, dnsprovider.Record{
+			ZoneID:   zoneID,
+			Name:     newDomain,
+			Type:     r.RecordType,
+			Content:  r.IngressDestination,
+			TTL:      r.RecordTTL,
+			OwnerRef: dnsprovider.OwnerRefFor(service.Namespace, service.Name),
+		})
+		if createErr != nil {
+			log.Error().Err(createErr).Msgf("[DNS] [%s] Failed to create record in new zone", service.Name)
 			return
 		}
-		r.cacheDelete(oldDomain)
-		r.HandleAnnotations(ctx, service)
+		if delErr := r.Provider.DeleteRecord(ctx, existing.ZoneID, existing.ID); delErr != nil {
+			// Replacement is live; log the orphan and continue. A
+			// future cleanupStaleRecords pass will retry the delete.
+			log.Error().Err(delErr).Msgf("[DNS] [%s] Failed to delete record in old zone after migration", service.Name)
+		}
+		if oldDomain != newDomain {
+			r.cacheDelete(oldDomain)
+		}
+		r.cacheSet(newDomain, created)
 		return
 	}
 

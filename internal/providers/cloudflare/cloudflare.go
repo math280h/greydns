@@ -55,9 +55,13 @@ func New(cfg registry.ProviderConfig, secret map[string][]byte) (dnsprovider.Pro
 	if token == "" {
 		return nil, errors.New("cloudflare: secret key \"cloudflare-token\" is empty or missing")
 	}
+	proxied, err := cfg.GetBool("proxy-enabled", false)
+	if err != nil {
+		return nil, fmt.Errorf("cloudflare: %w", err)
+	}
 	return &Provider{
 		api:     cf.NewClient(option.WithAPIToken(token)),
-		proxied: cfg.GetBool("proxy-enabled", false),
+		proxied: proxied,
 	}, nil
 }
 

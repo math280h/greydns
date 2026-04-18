@@ -58,38 +58,73 @@ func main() {
 	log.Info().Str("provider", provider.Name()).Msg("[Core] DNS provider ready")
 
 	ttl := mustAtoi(cfg.GetRequiredConfigValue("record-ttl"), "record-ttl")
-	refreshInterval := time.Duration(
-		mustAtoi(cfg.GetRequiredConfigValue("cache-refresh-seconds"), "cache-refresh-seconds"),
-	) * time.Second
+	refreshSeconds := mustAtoi(cfg.GetRequiredConfigValue("cache-refresh-seconds"), "cache-refresh-seconds")
+	if refreshSeconds <= 0 {
+		log.Fatal().
+			Int("cache-refresh-seconds", refreshSeconds).
+			Msg("[Core] cache-refresh-seconds must be greater than 0")
+	}
+	refreshInterval := time.Duration(refreshSeconds) * time.Second
+
 	recordType := dnsprovider.RecordType(cfg.GetRequiredConfigValue("record-type"))
 	if typeErr := dnsprovider.ValidateRecordType(recordType, provider.SupportedRecordTypes()); typeErr != nil {
 		log.Fatal().Err(typeErr).Str("provider", provider.Name()).Msg("[Core] record-type rejected by provider")
 	}
 
 	ctx := context.Background()
-	zonesToNames := mustListZones(ctx, provider)
+	zoneNameToID := mustListZones(ctx, provider)
 
-	reconciler := &records.Reconciler{
-		Provider:           provider,
-		Cache:              refreshCache(ctx, provider, zonesToNames),
-		ZonesToNames:       zonesToNames,
-		IngressDestination: cfg.GetRequiredConfigValue("ingress-destination"),
-		RecordTTL:          ttl,
-		RecordType:         recordType,
+	initialCache, refreshErr := refreshCache(ctx, provider, zoneNameToID)
+	if refreshErr != nil {
+		log.Fatal().Err(refreshErr).Msg("[Core] Initial cache refresh failed")
 	}
 
-	go func() {
-		ticker := time.NewTicker(refreshInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			reconciler.ReplaceCache(refreshCache(ctx, provider, zonesToNames))
-		}
-	}()
+	reconciler := records.NewReconciler(
+		provider,
+		zoneNameToID,
+		cfg.GetRequiredConfigValue("ingress-destination"),
+		ttl,
+		recordType,
+	)
+	reconciler.ReplaceCache(initialCache)
+
+	go runRefreshLoop(ctx, provider, zoneNameToID, reconciler, refreshInterval)
 
 	factory := informers.NewSharedInformerFactory(clientset, 30*time.Second)
 	serviceInformer := factory.Core().V1().Services().Informer()
 
-	_, err = serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if _, evtErr := serviceInformer.AddEventHandler(serviceEventHandlers(ctx, reconciler)); evtErr != nil {
+		log.Fatal().Err(evtErr).Msg("[Core] Failed to add event handler")
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	factory.Start(stopCh)
+
+	select {}
+}
+
+func runRefreshLoop(
+	ctx context.Context,
+	provider dnsprovider.Provider,
+	zoneNameToID map[string]string,
+	reconciler *records.Reconciler,
+	interval time.Duration,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		next, err := refreshCache(ctx, provider, zoneNameToID)
+		if err != nil {
+			log.Error().Err(err).Msg("[Core] Cache refresh failed; keeping previous cache")
+			continue
+		}
+		reconciler.ReplaceCache(next)
+	}
+}
+
+func serviceEventHandlers(ctx context.Context, reconciler *records.Reconciler) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			service, ok := obj.(*v1.Service)
 			if !ok {
@@ -123,17 +158,7 @@ func main() {
 			}
 			reconciler.HandleDeletions(ctx, service)
 		},
-	})
-	if err != nil {
-		log.Fatal().Err(err).Msg("[Core] Failed to add event handler")
-		return
 	}
-
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-	factory.Start(stopCh)
-
-	select {}
 }
 
 // greydnsAnnotationsChanged returns true when any greydns.io/* key
@@ -170,17 +195,21 @@ func mustListZones(ctx context.Context, provider dnsprovider.Provider) map[strin
 	return out
 }
 
+// refreshCache rebuilds the domain-keyed record cache by listing owned
+// records across every managed zone. It returns an error if any zone
+// fails to list: the caller must then keep the previous cache rather
+// than swap in a partial view, which would cause the controller to
+// "forget" records and incorrectly try to recreate or leak them.
 func refreshCache(
 	ctx context.Context,
 	provider dnsprovider.Provider,
 	zones map[string]string,
-) map[string]dnsprovider.Record {
+) (map[string]dnsprovider.Record, error) {
 	out := make(map[string]dnsprovider.Record)
 	for _, id := range zones {
 		recs, err := provider.ListOwnedRecords(ctx, id)
 		if err != nil {
-			log.Error().Err(err).Str("zone", id).Msg("[Core] Failed to list records")
-			continue
+			return nil, err
 		}
 		for _, r := range recs {
 			out[r.Name] = r
@@ -188,5 +217,5 @@ func refreshCache(
 		}
 	}
 	log.Info().Msgf("[Core] Refresh found %d records", len(out))
-	return out
+	return out, nil
 }

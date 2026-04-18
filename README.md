@@ -24,7 +24,7 @@ GreyDNS uses a pluggable provider system. Exactly one provider is active at a ti
 
 ### Coming Soon
 
-- **Route 53** 
+- **Route 53**
 - **Google Cloud DNS Support**
 - **Azure DNS Support**
 
@@ -108,7 +108,7 @@ Universal DNS concepts live at the top level so they're not duplicated across pr
 
 | Config Key | Description | Required |
 |------------|-------------|----------|
-| `provider` | Active provider name (e.g. `cloudflare`, `route53`) | Yes |
+| `provider` | Active provider name (today: `cloudflare`) | Yes |
 | `record-type` | DNS record type (`A`, `CNAME`, ...) | Yes |
 | `record-ttl` | DNS record time-to-live in seconds | Yes |
 | `cache-refresh-seconds` | Cache refresh interval | Yes |

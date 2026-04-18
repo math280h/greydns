@@ -46,16 +46,22 @@ func (c ProviderConfig) GetOptional(suffix, defaultValue string) string {
 	return defaultValue
 }
 
-func (c ProviderConfig) GetBool(suffix string, defaultValue bool) bool {
-	raw, ok := c.Data[c.key(suffix)]
+// GetBool returns the boolean value for the provider-namespaced key.
+// Returns defaultValue when the key is unset. Returns an error when
+// the key is set but not parseable as a boolean; callers propagate
+// the error from their factory so misconfiguration surfaces at startup
+// rather than silently disabling a feature.
+func (c ProviderConfig) GetBool(suffix string, defaultValue bool) (bool, error) {
+	key := c.key(suffix)
+	raw, ok := c.Data[key]
 	if !ok {
-		return defaultValue
+		return defaultValue, nil
 	}
 	parsed, err := strconv.ParseBool(raw)
 	if err != nil {
-		return defaultValue
+		return false, fmt.Errorf("invalid boolean value for config key %q: %q", key, raw)
 	}
-	return parsed
+	return parsed, nil
 }
 
 var (
