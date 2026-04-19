@@ -47,6 +47,7 @@ func setupTest(t *testing.T) (*records.Reconciler, *fake.Provider, *record.FakeR
 		testIngress,
 		60,
 		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("", false),
 	)
 	return r, provider, recorder
 }
@@ -488,6 +489,7 @@ func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
 		testIngress,
 		60,
 		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("", false),
 	)
 
 	existing, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
@@ -585,6 +587,7 @@ func TestHandleDeletions_RetriesFailedDeletes(t *testing.T) {
 		testIngress,
 		60,
 		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("", false),
 	)
 
 	existing, err := base.CreateRecord(context.Background(), dnsprovider.Record{
@@ -649,6 +652,7 @@ func TestHandleDeletions_DedupesRepeatedEnqueues(t *testing.T) {
 		testIngress,
 		60,
 		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("", false),
 	)
 
 	r.SeedCache(dnsprovider.Record{
@@ -691,6 +695,7 @@ func TestReconciler_CacheConcurrentAccess(t *testing.T) {
 		testIngress,
 		60,
 		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("", false),
 	)
 
 	const workers = 8
@@ -773,5 +778,258 @@ func TestHandleAnnotations_ReconcilesDriftedRecord(t *testing.T) {
 	}
 	if snap[0].Content != testIngress {
 		t.Fatalf("provider content not reconciled: got %q", snap[0].Content)
+	}
+}
+
+func TestHandleAnnotations_PerServiceTTLOverride(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	s := svc(dnsAnnotations(testZoneName, testDomain))
+	s.Annotations[records.AnnotationTTL] = "900"
+	r.HandleAnnotations(context.Background(), s)
+
+	snap := provider.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("want 1 record, got %d", len(snap))
+	}
+	if snap[0].TTL != 900 {
+		t.Fatalf("TTL = %d, want 900", snap[0].TTL)
+	}
+}
+
+func TestHandleAnnotations_PerServiceRecordTypeOverride(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	s := svc(dnsAnnotations(testZoneName, testDomain))
+	s.Annotations[records.AnnotationRecordType] = "CNAME"
+	r.HandleAnnotations(context.Background(), s)
+
+	snap := provider.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("want 1 record, got %d", len(snap))
+	}
+	if snap[0].Type != dnsprovider.RecordTypeCNAME {
+		t.Fatalf("Type = %q, want CNAME", snap[0].Type)
+	}
+}
+
+func TestHandleAnnotations_InvalidTTLAnnotationEmitsEvent(t *testing.T) {
+	r, provider, recorder := setupTest(t)
+
+	s := svc(dnsAnnotations(testZoneName, testDomain))
+	s.Annotations[records.AnnotationTTL] = "not-an-int"
+	r.HandleAnnotations(context.Background(), s)
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "InvalidAnnotation") {
+			t.Fatalf("want InvalidAnnotation event, got %q", ev)
+		}
+	default:
+		t.Fatal("expected InvalidAnnotation event, got none")
+	}
+	// Fell back to controller default, still created the record.
+	snap := provider.Snapshot()
+	if len(snap) != 1 || snap[0].TTL != 60 {
+		t.Fatalf("fallback TTL not applied: %+v", snap)
+	}
+}
+
+func TestHandleAnnotations_UnsupportedRecordTypeEmitsEvent(t *testing.T) {
+	r, _, recorder := setupTest(t)
+
+	s := svc(dnsAnnotations(testZoneName, testDomain))
+	s.Annotations[records.AnnotationRecordType] = "MX"
+	r.HandleAnnotations(context.Background(), s)
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "InvalidAnnotation") {
+			t.Fatalf("want InvalidAnnotation event, got %q", ev)
+		}
+	default:
+		t.Fatal("expected InvalidAnnotation event, got none")
+	}
+}
+
+func TestHandleAnnotations_ProviderHintsFlowThrough(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	s := svc(dnsAnnotations(testZoneName, testDomain))
+	s.Annotations["greydns.io/fake-proxied"] = "true"
+	s.Annotations["greydns.io/fake-mode"] = "strict"
+	s.Annotations["greydns.io/unrelated"] = "ignored"
+	r.HandleAnnotations(context.Background(), s)
+
+	snap := provider.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("want 1 record, got %d", len(snap))
+	}
+	hints := snap[0].ProviderHints
+	if hints["proxied"] != "true" {
+		t.Fatalf("proxied hint = %q, want true", hints["proxied"])
+	}
+	if hints["mode"] != "strict" {
+		t.Fatalf("mode hint = %q, want strict", hints["mode"])
+	}
+	if _, unrelated := hints["unrelated"]; unrelated {
+		t.Fatal("non-prefixed annotation leaked into hints")
+	}
+}
+
+func TestOverridePolicy_Allows(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		hasKey  bool
+		queries map[string]bool
+	}{
+		{
+			name:   "missing key allows all",
+			raw:    "",
+			hasKey: false,
+			queries: map[string]bool{
+				"ttl":               true,
+				"record-type":       true,
+				"cloudflare-proxied": true,
+			},
+		},
+		{
+			name:   "star allows all",
+			raw:    "*",
+			hasKey: true,
+			queries: map[string]bool{
+				"ttl":               true,
+				"cloudflare-proxied": true,
+			},
+		},
+		{
+			name:   "empty string denies all",
+			raw:    "",
+			hasKey: true,
+			queries: map[string]bool{
+				"ttl":         false,
+				"record-type": false,
+			},
+		},
+		{
+			name:   "allowlist ignores unlisted",
+			raw:    "ttl, record-type",
+			hasKey: true,
+			queries: map[string]bool{
+				"ttl":               true,
+				"record-type":       true,
+				"cloudflare-proxied": false,
+				"unknown":           false,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			policy := records.NewOverridePolicy(tc.raw, tc.hasKey)
+			for key, want := range tc.queries {
+				if got := policy.Allows(key); got != want {
+					t.Errorf("Allows(%q) = %v, want %v", key, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestHandleAnnotations_TTLOverrideBlockedByPolicy(t *testing.T) {
+	stubRecorder(t)
+	provider := fake.New(dnsprovider.Zone{ID: testZoneID, Name: testZoneName})
+	recorder := record.NewFakeRecorder(16)
+	utils.Recorder = recorder //nolint:reassign // test stubs the recorder
+	r := records.NewReconciler(
+		provider,
+		map[string]string{testZoneName: testZoneID},
+		testIngress,
+		60,
+		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("record-type", true),
+	)
+
+	s := svc(dnsAnnotations(testZoneName, testDomain))
+	s.Annotations[records.AnnotationTTL] = "900"
+	r.HandleAnnotations(context.Background(), s)
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "InvalidAnnotation") || !strings.Contains(ev, "allowed-overrides") {
+			t.Fatalf("want InvalidAnnotation about allowed-overrides, got %q", ev)
+		}
+	default:
+		t.Fatal("expected InvalidAnnotation event, got none")
+	}
+	snap := provider.Snapshot()
+	if len(snap) != 1 || snap[0].TTL != 60 {
+		t.Fatalf("TTL override should have been blocked, got %+v", snap)
+	}
+}
+
+func TestHandleAnnotations_ProviderHintBlockedByPolicy(t *testing.T) {
+	stubRecorder(t)
+	provider := fake.New(dnsprovider.Zone{ID: testZoneID, Name: testZoneName})
+	recorder := record.NewFakeRecorder(16)
+	utils.Recorder = recorder //nolint:reassign // test stubs the recorder
+	r := records.NewReconciler(
+		provider,
+		map[string]string{testZoneName: testZoneID},
+		testIngress,
+		60,
+		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("ttl", true),
+	)
+
+	s := svc(dnsAnnotations(testZoneName, testDomain))
+	s.Annotations["greydns.io/fake-proxied"] = "true"
+	r.HandleAnnotations(context.Background(), s)
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "InvalidAnnotation") {
+			t.Fatalf("want InvalidAnnotation, got %q", ev)
+		}
+	default:
+		t.Fatal("expected InvalidAnnotation event, got none")
+	}
+	snap := provider.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("want 1 record, got %d", len(snap))
+	}
+	if _, set := snap[0].ProviderHints["proxied"]; set {
+		t.Fatalf("provider hint should have been blocked, got %+v", snap[0].ProviderHints)
+	}
+}
+
+func TestHandleAnnotations_TTLOverrideDriftTriggersUpdate(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	// Seed a record with the controller default TTL.
+	existing, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Type:     dnsprovider.RecordTypeA,
+		Content:  testIngress,
+		TTL:      60,
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+	r.SeedCache(existing)
+
+	// Reconcile with a TTL override that differs from the cached TTL.
+	s := svc(dnsAnnotations(testZoneName, testDomain))
+	s.Annotations[records.AnnotationTTL] = "900"
+	r.HandleAnnotations(context.Background(), s)
+
+	snap := provider.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("want 1 record, got %d", len(snap))
+	}
+	if snap[0].TTL != 900 {
+		t.Fatalf("TTL drift not reconciled: got %d, want 900", snap[0].TTL)
 	}
 }

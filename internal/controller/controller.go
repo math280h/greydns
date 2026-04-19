@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,7 +80,7 @@ func (c *Controller) Ready() bool {
 
 func (c *Controller) eventHandlers(ctx context.Context) cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+		AddFunc: func(obj any) {
 			service, ok := obj.(*v1.Service)
 			if !ok {
 				log.Error().Msg("[Core] Failed to cast object")
@@ -87,7 +88,7 @@ func (c *Controller) eventHandlers(ctx context.Context) cache.ResourceEventHandl
 			}
 			c.reconciler.HandleAnnotations(ctx, service)
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			service, ok := newObj.(*v1.Service)
 			if !ok {
 				log.Error().Msg("[Core] Failed to cast object during update")
@@ -104,7 +105,7 @@ func (c *Controller) eventHandlers(ctx context.Context) cache.ResourceEventHandl
 			log.Info().Msgf("[Core] [%s] Annotations changed, updating records", service.Name)
 			c.reconciler.HandleUpdates(ctx, service, oldService)
 		},
-		DeleteFunc: func(obj interface{}) {
+		DeleteFunc: func(obj any) {
 			service := extractServiceFromDelete(obj)
 			if service == nil {
 				return
@@ -114,11 +115,22 @@ func (c *Controller) eventHandlers(ctx context.Context) cache.ResourceEventHandl
 	}
 }
 
-// AnnotationsChanged also catches additions and removals, not just
-// in-place value changes.
+// AnnotationsChanged also catches additions, removals, and per-Service
+// override keys without maintaining a static allowlist.
 func AnnotationsChanged(service, oldService *v1.Service) bool {
-	for _, key := range records.AnnotationKeys {
-		if service.Annotations[key] != oldService.Annotations[key] {
+	for k, v := range service.Annotations {
+		if !strings.HasPrefix(k, records.AnnotationPrefix) {
+			continue
+		}
+		if v != oldService.Annotations[k] {
+			return true
+		}
+	}
+	for k, v := range oldService.Annotations {
+		if !strings.HasPrefix(k, records.AnnotationPrefix) {
+			continue
+		}
+		if _, stillPresent := service.Annotations[k]; !stillPresent && v != "" {
 			return true
 		}
 	}
@@ -128,7 +140,7 @@ func AnnotationsChanged(service, oldService *v1.Service) bool {
 // extractServiceFromDelete also unwraps DeletedFinalStateUnknown
 // tombstones, which client-go sends when the informer missed the raw
 // delete; ignoring them would leak records.
-func extractServiceFromDelete(obj interface{}) *v1.Service {
+func extractServiceFromDelete(obj any) *v1.Service {
 	if svc, ok := obj.(*v1.Service); ok {
 		return svc
 	}
