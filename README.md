@@ -98,7 +98,7 @@ metadata:
   name: my-service
   annotations:
     greydns.io/dns: "true"
-    greydns.io/domain: "api.example.com"
+    greydns.io/domain: "api.example.com,api-v2.example.com"
     greydns.io/zone: "example.com"
     # Optional per-Service overrides:
     greydns.io/ttl: "300"
@@ -114,7 +114,7 @@ spec:
 |------------|----------|-------------|
 | `greydns.io/dns` | Yes | Must be `"true"` for greydns to manage this Service. |
 | `greydns.io/zone` | Yes | Managed DNS zone name (must match a provider-visible zone). |
-| `greydns.io/domain` | Yes | Fully-qualified record name to create. |
+| `greydns.io/domain` | Yes | Fully-qualified record name(s). Comma-separated list is accepted; one DNS record is created per entry, all in the same zone. |
 | `greydns.io/ttl` | No | Positive integer seconds. Overrides the controller-wide `record-ttl`. |
 | `greydns.io/record-type` | No | One of the provider's supported record types. Overrides `record-type`. |
 | `greydns.io/<provider>-<key>` | No | Provider-scoped override, e.g. `greydns.io/cloudflare-proxied`. |

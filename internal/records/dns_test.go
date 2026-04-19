@@ -1033,3 +1033,183 @@ func TestHandleAnnotations_TTLOverrideDriftTriggersUpdate(t *testing.T) {
 		t.Fatalf("TTL drift not reconciled: got %d, want 900", snap[0].TTL)
 	}
 }
+
+func TestHandleAnnotations_MultipleDomainsCreateAll(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	s := svc(dnsAnnotations(testZoneName, "a.example.com, b.example.com,c.example.com"))
+	r.HandleAnnotations(context.Background(), s)
+
+	names := map[string]bool{}
+	for _, rec := range provider.Snapshot() {
+		names[rec.Name] = true
+	}
+	for _, want := range []string{"a.example.com", "b.example.com", "c.example.com"} {
+		if !names[want] {
+			t.Fatalf("missing %s in provider, got %v", want, names)
+		}
+	}
+	if r.CacheLen() != 3 {
+		t.Fatalf("cache should have 3 records, has %d", r.CacheLen())
+	}
+}
+
+func TestHandleAnnotations_DedupesDomainsInAnnotation(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	s := svc(dnsAnnotations(testZoneName, "a.example.com,a.example.com, a.example.com"))
+	r.HandleAnnotations(context.Background(), s)
+
+	if len(provider.Snapshot()) != 1 {
+		t.Fatalf("duplicated domain should produce one record, got %d", len(provider.Snapshot()))
+	}
+}
+
+func TestHandleUpdates_AddsNewDomainKeepsExisting(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	oldSvc := svc(dnsAnnotations(testZoneName, "a.example.com"))
+	r.HandleAnnotations(context.Background(), oldSvc)
+	if len(provider.Snapshot()) != 1 {
+		t.Fatalf("initial create failed, have %d records", len(provider.Snapshot()))
+	}
+
+	newSvc := svc(dnsAnnotations(testZoneName, "a.example.com,b.example.com"))
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	names := map[string]bool{}
+	for _, rec := range provider.Snapshot() {
+		names[rec.Name] = true
+	}
+	if !names["a.example.com"] || !names["b.example.com"] {
+		t.Fatalf("expected both records, got %v", names)
+	}
+}
+
+func TestHandleUpdates_DroppedDomainGetsCleanedUp(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	oldSvc := svc(dnsAnnotations(testZoneName, "a.example.com,b.example.com"))
+	r.HandleAnnotations(context.Background(), oldSvc)
+	if len(provider.Snapshot()) != 2 {
+		t.Fatalf("initial create failed, have %d records", len(provider.Snapshot()))
+	}
+
+	newSvc := svc(dnsAnnotations(testZoneName, "a.example.com"))
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	snap := provider.Snapshot()
+	if len(snap) != 1 || snap[0].Name != "a.example.com" {
+		t.Fatalf("expected only a.example.com, got %+v", snap)
+	}
+}
+
+func TestHandleUpdates_ContestedNewDomainPreservesOldRecords(t *testing.T) {
+	// Regression: if one of the new domains is owned by a peer, the
+	// reconciler must NOT delete the old records while the rename is
+	// blocked. Otherwise the Service loses DNS entirely because of a
+	// misconfiguration elsewhere.
+	r, provider, _ := setupTest(t)
+
+	oldSvc := svc(dnsAnnotations(testZoneName, "a.example.com"))
+	r.HandleAnnotations(context.Background(), oldSvc)
+
+	// Seed a peer-owned record at the new target name.
+	r.SeedCache(dnsprovider.Record{
+		ID:       "peer-id",
+		ZoneID:   testZoneID,
+		Name:     "b.example.com",
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, "peer"),
+	})
+
+	newSvc := svc(dnsAnnotations(testZoneName, "b.example.com"))
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	names := map[string]bool{}
+	for _, rec := range provider.Snapshot() {
+		names[rec.Name] = true
+	}
+	if !names["a.example.com"] {
+		t.Fatalf("a.example.com should be preserved when rename target is contested, got %v", names)
+	}
+}
+
+func TestHandleUpdates_RenameWithStaleCacheSkipsToAvoidLeak(t *testing.T) {
+	// Regression: when a Service renames its domain but the cache has
+	// lost the old record, we must abort rather than create the new
+	// record and leak the old one (cleanup can't delete a record it
+	// can't see).
+	r, provider, _ := setupTest(t)
+
+	// Seed the provider with the old record but leave the cache empty,
+	// mimicking a stale cache window between a create and the next
+	// refresh.
+	seeded, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
+		ZoneID:   testZoneID,
+		Name:     "old.example.com",
+		Type:     dnsprovider.RecordTypeA,
+		Content:  testIngress,
+		TTL:      60,
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	oldSvc := svc(dnsAnnotations(testZoneName, "old.example.com"))
+	newSvc := svc(dnsAnnotations(testZoneName, "new.example.com"))
+
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	// Provider should still hold only the old record: new.example.com
+	// was not created, and old.example.com was not deleted.
+	snap := provider.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("provider should hold exactly the seeded record, got %d", len(snap))
+	}
+	if snap[0].ID != seeded.ID || snap[0].Name != "old.example.com" {
+		t.Fatalf("seeded record should be intact, got %+v", snap[0])
+	}
+}
+
+func TestHandleUpdates_ZoneMigrationWithStaleCacheSkipsToAvoidLeak(t *testing.T) {
+	// Same defence for zone migration: if the cache lost the old-zone
+	// record, skip so the next refresh can repopulate before we make
+	// changes.
+	const otherZoneID, otherZoneName = "zone-id-2", "other.example"
+	provider := fake.New(
+		dnsprovider.Zone{ID: testZoneID, Name: testZoneName},
+		dnsprovider.Zone{ID: otherZoneID, Name: otherZoneName},
+	)
+	stubRecorder(t)
+	r := records.NewReconciler(
+		provider,
+		map[string]string{testZoneName: testZoneID, otherZoneName: otherZoneID},
+		testIngress,
+		60,
+		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("", false),
+	)
+
+	seeded, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Type:     dnsprovider.RecordTypeA,
+		Content:  testIngress,
+		TTL:      60,
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
+	newSvc := svc(dnsAnnotations(otherZoneName, testDomain))
+
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	snap := provider.Snapshot()
+	if len(snap) != 1 || snap[0].ID != seeded.ID {
+		t.Fatalf("seeded record should be intact, provider has %+v", snap)
+	}
+}

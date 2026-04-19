@@ -307,3 +307,25 @@ func TestController_PerServiceTTLTriggersUpdate(t *testing.T) {
 		return len(snap) == 1 && snap[0].TTL == 900
 	})
 }
+
+func TestController_MultipleDomainsCreateAll(t *testing.T) {
+	rig := newRig(t)
+	ctx := context.Background()
+
+	svc := newService(itSvcName, map[string]string{
+		records.AnnotationDNS:    "true",
+		records.AnnotationZone:   itZoneName,
+		records.AnnotationDomain: "one.example.com, two.example.com",
+	})
+	if _, err := rig.clientset.CoreV1().Services(itNamespace).Create(ctx, svc, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	eventually(t, "both records created", func() bool {
+		names := map[string]bool{}
+		for _, rec := range rig.provider.Snapshot() {
+			names[rec.Name] = true
+		}
+		return names["one.example.com"] && names["two.example.com"]
+	})
+}
