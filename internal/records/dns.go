@@ -13,6 +13,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 
 	"github.com/math280h/greydns/internal/dnsprovider"
+	"github.com/math280h/greydns/internal/metrics"
 	"github.com/math280h/greydns/internal/utils"
 )
 
@@ -200,6 +201,7 @@ func (r *Reconciler) rebuildIndexes() {
 			r.byOwner[rec.OwnerRef] = append(r.byOwner[rec.OwnerRef], k)
 		}
 	}
+	metrics.CacheRecords.Set(float64(len(r.cache)))
 }
 
 // SeedCache inserts a record into the cache under its (ZoneID, ID) key.
@@ -250,12 +252,14 @@ func (r *Reconciler) DrainDeleteRetries(ctx context.Context) {
 	pending := r.deleteRetries
 	r.deleteRetries = nil
 	r.mu.Unlock()
+	metrics.RetryQueueDepth.Set(0)
 	if len(pending) == 0 {
 		return
 	}
 	log.Info().Int("pending", len(pending)).Msg("[DNS] Retrying failed record deletes")
 	for _, p := range pending {
-		if err := r.provider.DeleteRecord(ctx, p.ZoneID, p.ID); err != nil {
+		err := r.callProviderDelete(ctx, p.ZoneID, p.ID)
+		if err != nil {
 			log.Error().Err(err).Msgf("[DNS] Retry delete failed for record %s", p.Name)
 			r.enqueueDeleteRetry(p)
 			continue
@@ -278,6 +282,7 @@ func (r *Reconciler) enqueueDeleteRetry(p pendingDelete) {
 		}
 	}
 	r.deleteRetries = append(r.deleteRetries, p)
+	metrics.RetryQueueDepth.Set(float64(len(r.deleteRetries)))
 }
 
 func (r *Reconciler) cacheSet(k CacheKey, rec dnsprovider.Record) {
@@ -298,6 +303,7 @@ func (r *Reconciler) cacheSet(k CacheKey, rec dnsprovider.Record) {
 	r.cache[k] = rec
 	r.indexInsert(k, rec)
 	r.writeGen++
+	metrics.CacheRecords.Set(float64(len(r.cache)))
 }
 
 func (r *Reconciler) cacheDelete(k CacheKey) {
@@ -308,6 +314,7 @@ func (r *Reconciler) cacheDelete(k CacheKey) {
 		delete(r.cache, k)
 	}
 	r.writeGen++
+	metrics.CacheRecords.Set(float64(len(r.cache)))
 }
 
 // cacheOwnedBy returns a snapshot of every cached record whose OwnerRef
@@ -436,6 +443,7 @@ func emitInvalidAnnotation(service *v1.Service, detail string) {
 		"Invalid greydns annotations: %s",
 		detail,
 	)
+	metrics.Reconciles.WithLabelValues(metrics.OutcomeInvalidAnnotation).Inc()
 }
 
 func (r *Reconciler) HandleAnnotations(ctx context.Context, service *v1.Service) {
@@ -494,6 +502,7 @@ func (r *Reconciler) oldRecordsStillCached(service, oldService *v1.Service, owne
 				"[DNS] [%s] Old record %s missing from cache; skipping update until next refresh",
 				service.Name, d,
 			)
+			metrics.Reconciles.WithLabelValues(metrics.OutcomeSkippedStaleCache).Inc()
 			return false
 		}
 	}
@@ -511,32 +520,38 @@ func (r *Reconciler) reconcileDomain(
 	existing, exists := r.CacheRecord(desired.ZoneID, desired.Name, desired.OwnerRef)
 	if !exists {
 		log.Info().Msgf("[DNS] [%s] Creating record %s", service.Name, desired.Name)
-		created, err := r.provider.CreateRecord(ctx, desired)
+		created, err := r.callProviderCreate(ctx, desired)
 		if err != nil {
+			metrics.Reconciles.WithLabelValues(metrics.OutcomeError).Inc()
 			log.Error().Err(err).Msgf("[DNS] [%s] Failed to create %s", service.Name, desired.Name)
 			return false
 		}
 		r.cacheSet(CacheKey{ZoneID: created.ZoneID, ID: created.ID}, created)
+		metrics.Reconciles.WithLabelValues(metrics.OutcomeCreated).Inc()
 		return true
 	}
 	if !ownedBy(existing, service) {
 		emitDuplicateDomain(service)
+		metrics.Reconciles.WithLabelValues(metrics.OutcomeDuplicateDomain).Inc()
 		return false
 	}
 	if !hasDrift(existing, desired) {
 		log.Debug().Msgf("[DNS] [%s] %s matches desired state", service.Name, desired.Name)
+		metrics.Reconciles.WithLabelValues(metrics.OutcomeNoop).Inc()
 		return true
 	}
 	log.Info().Msgf("[DNS] [%s] Drift on %s, updating", service.Name, desired.Name)
 	update := desired
 	update.ID = existing.ID
 	update.ZoneID = existing.ZoneID
-	updated, err := r.provider.UpdateRecord(ctx, update)
+	updated, err := r.callProviderUpdate(ctx, update)
 	if err != nil {
+		metrics.Reconciles.WithLabelValues(metrics.OutcomeError).Inc()
 		log.Error().Err(err).Msgf("[DNS] [%s] Failed to update %s", service.Name, desired.Name)
 		return false
 	}
 	r.cacheSet(CacheKey{ZoneID: updated.ZoneID, ID: updated.ID}, updated)
+	metrics.Reconciles.WithLabelValues(metrics.OutcomeUpdated).Inc()
 	return true
 }
 
@@ -675,11 +690,35 @@ func (r *Reconciler) HandleDeletions(ctx context.Context, service *v1.Service) {
 // provider call is still failing won't get a cache-miss and produce a
 // duplicate create.
 func (r *Reconciler) deleteRecordOrRetry(ctx context.Context, serviceName string, rec dnsprovider.Record) {
-	if err := r.provider.DeleteRecord(ctx, rec.ZoneID, rec.ID); err != nil {
+	if err := r.callProviderDelete(ctx, rec.ZoneID, rec.ID); err != nil {
 		log.Error().Err(err).Msgf("[DNS] [%s] Failed to delete record %s; will retry", serviceName, rec.Name)
 		r.enqueueDeleteRetry(pendingDelete{ZoneID: rec.ZoneID, ID: rec.ID, Name: rec.Name})
 		return
 	}
 	log.Info().Msgf("[DNS] [%s] Deleted record %s", serviceName, rec.Name)
 	r.cacheDelete(CacheKey{ZoneID: rec.ZoneID, ID: rec.ID})
+}
+
+// callProviderCreate / callProviderUpdate / callProviderDelete wrap
+// the reconciler's provider calls with timing + outcome metrics. The
+// refresh loop in cmd/main wraps its own list-path calls separately.
+func (r *Reconciler) callProviderCreate(ctx context.Context, rec dnsprovider.Record) (dnsprovider.Record, error) {
+	var err error
+	defer metrics.ObserveProviderCall(r.provider.Name(), metrics.OpCreate)(&err)
+	out, err := r.provider.CreateRecord(ctx, rec)
+	return out, err
+}
+
+func (r *Reconciler) callProviderUpdate(ctx context.Context, rec dnsprovider.Record) (dnsprovider.Record, error) {
+	var err error
+	defer metrics.ObserveProviderCall(r.provider.Name(), metrics.OpUpdate)(&err)
+	out, err := r.provider.UpdateRecord(ctx, rec)
+	return out, err
+}
+
+func (r *Reconciler) callProviderDelete(ctx context.Context, zoneID, id string) error {
+	var err error
+	defer metrics.ObserveProviderCall(r.provider.Name(), metrics.OpDelete)(&err)
+	err = r.provider.DeleteRecord(ctx, zoneID, id)
+	return err
 }
