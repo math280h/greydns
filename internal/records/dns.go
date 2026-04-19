@@ -443,22 +443,21 @@ func (r *Reconciler) HandleAnnotations(ctx context.Context, service *v1.Service)
 }
 
 // reconcile is the shared add/update path. oldService, when non-nil,
-// provides stale-cache protection: the previous desired set is used to
-// suppress a fresh create when the cache misses on a record the
-// Service used to already have at the same (zone, domain).
+// enables a stale-cache precheck: before creating or deleting anything,
+// every (zone, domain) pair the Service previously claimed must still
+// be visible in our cache. A miss means the cache is behind the
+// provider and proceeding would either create a duplicate or leak the
+// old record (since cleanup can't delete what it can't see).
 func (r *Reconciler) reconcile(ctx context.Context, service, oldService *v1.Service) {
 	zoneID, domains, ok := r.preflight(service)
 	if !ok {
 		return
 	}
 
-	oldPairs := make(map[nameKey]struct{})
+	ownerRef := dnsprovider.OwnerRefFor(service.Namespace, service.Name)
 	if oldService != nil {
-		oldZoneID, haveOldZone := r.zoneNameToID[oldService.Annotations[AnnotationZone]]
-		if haveOldZone {
-			for _, d := range parseDomains(oldService.Annotations[AnnotationDomain]) {
-				oldPairs[nameKey{ZoneID: oldZoneID, Name: d}] = struct{}{}
-			}
+		if !r.oldRecordsStillCached(service, oldService, ownerRef) {
+			return
 		}
 	}
 
@@ -466,7 +465,7 @@ func (r *Reconciler) reconcile(ctx context.Context, service, oldService *v1.Serv
 	allReconciled := true
 	for _, domain := range domains {
 		desiredNames[domain] = struct{}{}
-		if !r.reconcileDomain(ctx, service, r.desiredRecord(service, zoneID, domain), oldPairs) {
+		if !r.reconcileDomain(ctx, service, r.desiredRecord(service, zoneID, domain)) {
 			allReconciled = false
 		}
 	}
@@ -480,24 +479,37 @@ func (r *Reconciler) reconcile(ctx context.Context, service, oldService *v1.Serv
 	r.cleanupOwnedOutsideDesired(ctx, service, zoneID, desiredNames)
 }
 
+// oldRecordsStillCached returns false (and logs) if any (zone, domain)
+// the old Service claimed to own is missing from the cache. The caller
+// aborts in that case so the next refresh can repopulate before we
+// make any provider changes.
+func (r *Reconciler) oldRecordsStillCached(service, oldService *v1.Service, ownerRef string) bool {
+	oldZoneID, haveOldZone := r.zoneNameToID[oldService.Annotations[AnnotationZone]]
+	if !haveOldZone {
+		return true
+	}
+	for _, d := range parseDomains(oldService.Annotations[AnnotationDomain]) {
+		if _, found := r.CacheRecord(oldZoneID, d, ownerRef); !found {
+			log.Warn().Msgf(
+				"[DNS] [%s] Old record %s missing from cache; skipping update until next refresh",
+				service.Name, d,
+			)
+			return false
+		}
+	}
+	return true
+}
+
 // reconcileDomain returns true when the domain is in its desired state
 // (created, updated, or already matching), false when something
-// blocked it (DuplicateDomain, stale-cache guard, provider error).
+// blocked it (DuplicateDomain or a provider error).
 func (r *Reconciler) reconcileDomain(
 	ctx context.Context,
 	service *v1.Service,
 	desired dnsprovider.Record,
-	knownOldPairs map[nameKey]struct{},
 ) bool {
 	existing, exists := r.CacheRecord(desired.ZoneID, desired.Name, desired.OwnerRef)
 	if !exists {
-		if _, wasOld := knownOldPairs[nameKey{ZoneID: desired.ZoneID, Name: desired.Name}]; wasOld {
-			log.Warn().Msgf(
-				"[DNS] [%s] %s missing from cache (was in old annotations); skipping to avoid duplicate create",
-				service.Name, desired.Name,
-			)
-			return false
-		}
 		log.Info().Msgf("[DNS] [%s] Creating record %s", service.Name, desired.Name)
 		created, err := r.provider.CreateRecord(ctx, desired)
 		if err != nil {
