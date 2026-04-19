@@ -371,30 +371,52 @@ func ownedBy(rec dnsprovider.Record, service *v1.Service) bool {
 }
 
 // preflight validates the greydns annotations on service and resolves
-// its zone.
-func (r *Reconciler) preflight(service *v1.Service) (string, string, bool) {
+// its zone and desired domain list.
+func (r *Reconciler) preflight(service *v1.Service) (string, []string, bool) {
 	if !dnsEnabled(service) {
-		return "", "", false
+		return "", nil, false
 	}
 	log.Info().Msgf("[DNS] Service %s has DNS enabled", service.Name)
 
 	zoneName := service.Annotations[AnnotationZone]
 	if zoneName == "" {
 		emitInvalidAnnotation(service, "greydns.io/zone is empty")
-		return "", "", false
+		return "", nil, false
 	}
 	zoneID, ok := r.zoneNameToID[zoneName]
 	if !ok {
 		log.Error().Msgf("[DNS] [%s] Zone %q not managed by provider", service.Name, zoneName)
-		return "", "", false
+		return "", nil, false
 	}
 
-	domain := service.Annotations[AnnotationDomain]
-	if domain == "" {
+	domains := parseDomains(service.Annotations[AnnotationDomain])
+	if len(domains) == 0 {
 		emitInvalidAnnotation(service, "greydns.io/domain is empty")
-		return "", "", false
+		return "", nil, false
 	}
-	return zoneID, domain, true
+	return zoneID, domains, true
+}
+
+// parseDomains splits a CSV annotation value into trimmed, deduped,
+// non-empty entries while preserving order.
+func parseDomains(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	out := make([]string, 0, 1)
+	for item := range strings.SplitSeq(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, dup := seen[item]; dup {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
 }
 
 func emitDuplicateDomain(service *v1.Service) {
@@ -417,27 +439,115 @@ func emitInvalidAnnotation(service *v1.Service, detail string) {
 }
 
 func (r *Reconciler) HandleAnnotations(ctx context.Context, service *v1.Service) {
-	zoneID, domain, ok := r.preflight(service)
+	r.reconcile(ctx, service, nil)
+}
+
+// reconcile is the shared add/update path. oldService, when non-nil,
+// provides stale-cache protection: the previous desired set is used to
+// suppress a fresh create when the cache misses on a record the
+// Service used to already have at the same (zone, domain).
+func (r *Reconciler) reconcile(ctx context.Context, service, oldService *v1.Service) {
+	zoneID, domains, ok := r.preflight(service)
 	if !ok {
 		return
 	}
 
-	desired := r.desiredRecord(service, zoneID, domain)
-	existing, exists := r.CacheRecord(zoneID, domain, desired.OwnerRef)
-	if exists {
-		r.reconcileExistingRecord(ctx, service, existing, desired)
-		return
+	oldPairs := make(map[nameKey]struct{})
+	if oldService != nil {
+		oldZoneID, haveOldZone := r.zoneNameToID[oldService.Annotations[AnnotationZone]]
+		if haveOldZone {
+			for _, d := range parseDomains(oldService.Annotations[AnnotationDomain]) {
+				oldPairs[nameKey{ZoneID: oldZoneID, Name: d}] = struct{}{}
+			}
+		}
 	}
 
-	log.Info().Msgf("[DNS] [%s] Record does not exist, attempting to create", service.Name)
-	created, err := r.provider.CreateRecord(ctx, desired)
-	if err != nil {
-		log.Error().Err(err).Msgf("[DNS] [%s] Failed to create record", service.Name)
+	desiredNames := make(map[string]struct{}, len(domains))
+	allReconciled := true
+	for _, domain := range domains {
+		desiredNames[domain] = struct{}{}
+		if !r.reconcileDomain(ctx, service, r.desiredRecord(service, zoneID, domain), oldPairs) {
+			allReconciled = false
+		}
+	}
+
+	// Skip cleanup if any desired reconcile was blocked; deleting stale
+	// records while a rename target is contested would leave the
+	// Service with no DNS at all.
+	if !allReconciled {
 		return
 	}
-	log.Info().Msgf("[DNS] [%s] Record created", service.Name)
-	r.cacheSet(CacheKey{ZoneID: created.ZoneID, ID: created.ID}, created)
-	r.cleanupStaleRecords(ctx, service, created.ID, zoneID, domain)
+	r.cleanupOwnedOutsideDesired(ctx, service, zoneID, desiredNames)
+}
+
+// reconcileDomain returns true when the domain is in its desired state
+// (created, updated, or already matching), false when something
+// blocked it (DuplicateDomain, stale-cache guard, provider error).
+func (r *Reconciler) reconcileDomain(
+	ctx context.Context,
+	service *v1.Service,
+	desired dnsprovider.Record,
+	knownOldPairs map[nameKey]struct{},
+) bool {
+	existing, exists := r.CacheRecord(desired.ZoneID, desired.Name, desired.OwnerRef)
+	if !exists {
+		if _, wasOld := knownOldPairs[nameKey{ZoneID: desired.ZoneID, Name: desired.Name}]; wasOld {
+			log.Warn().Msgf(
+				"[DNS] [%s] %s missing from cache (was in old annotations); skipping to avoid duplicate create",
+				service.Name, desired.Name,
+			)
+			return false
+		}
+		log.Info().Msgf("[DNS] [%s] Creating record %s", service.Name, desired.Name)
+		created, err := r.provider.CreateRecord(ctx, desired)
+		if err != nil {
+			log.Error().Err(err).Msgf("[DNS] [%s] Failed to create %s", service.Name, desired.Name)
+			return false
+		}
+		r.cacheSet(CacheKey{ZoneID: created.ZoneID, ID: created.ID}, created)
+		return true
+	}
+	if !ownedBy(existing, service) {
+		emitDuplicateDomain(service)
+		return false
+	}
+	if !hasDrift(existing, desired) {
+		log.Debug().Msgf("[DNS] [%s] %s matches desired state", service.Name, desired.Name)
+		return true
+	}
+	log.Info().Msgf("[DNS] [%s] Drift on %s, updating", service.Name, desired.Name)
+	update := desired
+	update.ID = existing.ID
+	update.ZoneID = existing.ZoneID
+	updated, err := r.provider.UpdateRecord(ctx, update)
+	if err != nil {
+		log.Error().Err(err).Msgf("[DNS] [%s] Failed to update %s", service.Name, desired.Name)
+		return false
+	}
+	r.cacheSet(CacheKey{ZoneID: updated.ZoneID, ID: updated.ID}, updated)
+	return true
+}
+
+// cleanupOwnedOutsideDesired deletes any record owned by this Service
+// that isn't at one of the desired names in the current zone. Handles
+// annotation removal (a domain dropped from the CSV), zone migration
+// (old-zone records no longer desired), and residue from prior failed
+// reconciles.
+func (r *Reconciler) cleanupOwnedOutsideDesired(
+	ctx context.Context,
+	service *v1.Service,
+	currentZoneID string,
+	desiredNames map[string]struct{},
+) {
+	for _, rec := range r.cacheOwnedBy(service.Namespace, service.Name) {
+		if rec.ZoneID == currentZoneID {
+			if _, keep := desiredNames[rec.Name]; keep {
+				continue
+			}
+		}
+		log.Info().Msgf("[DNS] [%s] Cleaning up stale record %s", service.Name, rec.Name)
+		r.deleteRecordOrRetry(ctx, service.Name, rec)
+	}
 }
 
 func (r *Reconciler) desiredRecord(service *v1.Service, zoneID, domain string) dnsprovider.Record {
@@ -510,33 +620,6 @@ func (r *Reconciler) collectProviderHints(service *v1.Service) map[string]string
 	return hints
 }
 
-func (r *Reconciler) reconcileExistingRecord(
-	ctx context.Context,
-	service *v1.Service,
-	existing, desired dnsprovider.Record,
-) {
-	if !ownedBy(existing, service) {
-		emitDuplicateDomain(service)
-		return
-	}
-	if !hasDrift(existing, desired) {
-		log.Debug().Msgf("[DNS] [%s] Record exists and matches desired state", service.Name)
-		r.cleanupStaleRecords(ctx, service, existing.ID, desired.ZoneID, desired.Name)
-		return
-	}
-	log.Info().Msgf("[DNS] [%s] Record drift detected, updating", service.Name)
-	update := desired
-	update.ID = existing.ID
-	update.ZoneID = existing.ZoneID
-	updated, err := r.provider.UpdateRecord(ctx, update)
-	if err != nil {
-		log.Error().Err(err).Msgf("[DNS] [%s] Failed to update drifted record", service.Name)
-		return
-	}
-	r.cacheSet(CacheKey{ZoneID: updated.ZoneID, ID: updated.ID}, updated)
-	r.cleanupStaleRecords(ctx, service, updated.ID, desired.ZoneID, desired.Name)
-}
-
 // hasDrift compares fields the controller owns. Hints present only on
 // existing are provider-internal defaults and ignored.
 func hasDrift(existing, desired dnsprovider.Record) bool {
@@ -553,108 +636,8 @@ func hasDrift(existing, desired dnsprovider.Record) bool {
 	return false
 }
 
-// resolveUpdateExisting locates the record HandleUpdates should mutate
-// and performs the destination-ownership check that would otherwise
-// let a Service take over a peer's domain by changing its annotations.
-func (r *Reconciler) resolveUpdateExisting(
-	service *v1.Service,
-	oldZoneID, oldDomain, newZoneID, newDomain string,
-) (dnsprovider.Record, bool) {
-	ownerRef := dnsprovider.OwnerRefFor(service.Namespace, service.Name)
-	existing, exists := r.CacheRecord(oldZoneID, oldDomain, ownerRef)
-	if !exists {
-		// Cache miss despite the old Service having greydns
-		// annotations. The cache is likely stale. The record may
-		// already live at the new destination; if it does and we
-		// own it, proceed with that. Otherwise skip rather than
-		// create - a fresh create could duplicate if the provider
-		// still holds the original.
-		dest, destExists := r.CacheRecord(newZoneID, newDomain, ownerRef)
-		switch {
-		case destExists && ownedBy(dest, service):
-			return dest, true
-		case destExists:
-			emitDuplicateDomain(service)
-			return dnsprovider.Record{}, false
-		default:
-			log.Warn().Msgf(
-				"[DNS] [%s] Expected record missing from cache; skipping to avoid a duplicate create",
-				service.Name,
-			)
-			return dnsprovider.Record{}, false
-		}
-	}
-	if !ownedBy(existing, service) {
-		emitDuplicateDomain(service)
-		return dnsprovider.Record{}, false
-	}
-
-	// Rename or migration: if the destination key is different and
-	// already owned by a peer, abort so a Service can't take over
-	// another's domain by mutating its annotations.
-	if existing.ZoneID != newZoneID || oldDomain != newDomain {
-		dest, destExists := r.CacheRecord(newZoneID, newDomain, ownerRef)
-		if destExists && !ownedBy(dest, service) {
-			emitDuplicateDomain(service)
-			return dnsprovider.Record{}, false
-		}
-	}
-	return existing, true
-}
-
 func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.Service) {
-	zoneID, newDomain, ok := r.preflight(service)
-	if !ok {
-		return
-	}
-
-	oldDomain := oldService.Annotations[AnnotationDomain]
-	oldZoneID, haveOldZoneID := r.zoneNameToID[oldService.Annotations[AnnotationZone]]
-
-	if !haveOldZoneID || oldDomain == "" {
-		log.Info().Msgf("[DNS] [%s] Old record absent, creating fresh", service.Name)
-		r.HandleAnnotations(ctx, service)
-		return
-	}
-
-	existing, found := r.resolveUpdateExisting(service, oldZoneID, oldDomain, zoneID, newDomain)
-	if !found {
-		return
-	}
-
-	desired := r.desiredRecord(service, zoneID, newDomain)
-
-	// Zone change: the existing record lives in existing.ZoneID, which
-	// may differ from the zoneID resolved from the new annotation.
-	// Record IDs are zone-scoped, so an in-place update would target
-	// the wrong zone. Create the replacement in the new zone first;
-	// only delete the old-zone record once the new one is confirmed so
-	// a create failure leaves the Service still resolving.
-	if existing.ZoneID != zoneID {
-		log.Info().Msgf("[DNS] [%s] Zone changed, migrating record", service.Name)
-		created, createErr := r.provider.CreateRecord(ctx, desired)
-		if createErr != nil {
-			log.Error().Err(createErr).Msgf("[DNS] [%s] Failed to create record in new zone", service.Name)
-			return
-		}
-		r.cacheSet(CacheKey{ZoneID: created.ZoneID, ID: created.ID}, created)
-		r.deleteRecordOrRetry(ctx, service.Name, existing)
-		r.cleanupStaleRecords(ctx, service, created.ID, zoneID, newDomain)
-		return
-	}
-
-	log.Debug().Msgf("[DNS] [%s] Updating record", service.Name)
-	update := desired
-	update.ID = existing.ID
-	update.ZoneID = existing.ZoneID
-	updated, err := r.provider.UpdateRecord(ctx, update)
-	if err != nil {
-		log.Error().Err(err).Msgf("[DNS] [%s] Failed to update record", service.Name)
-		return
-	}
-	log.Info().Msgf("[DNS] [%s] Record updated", service.Name)
-	r.cacheSet(CacheKey{ZoneID: updated.ZoneID, ID: updated.ID}, updated)
-	r.cleanupStaleRecords(ctx, service, updated.ID, zoneID, newDomain)
+	r.reconcile(ctx, service, oldService)
 }
 
 // HandleDeletions removes every cached record owned by the deleted
@@ -668,24 +651,6 @@ func (r *Reconciler) HandleDeletions(ctx context.Context, service *v1.Service) {
 		return
 	}
 	for _, rec := range owned {
-		r.deleteRecordOrRetry(ctx, service.Name, rec)
-	}
-}
-
-// cleanupStaleRecords deletes any cached records still owned by service
-// other than the canonical (currentZoneID, currentDomain, currentID)
-// triplet. Handles rename residue and zone-migration residue from
-// prior failed reconciles. Failed deletes are queued for retry.
-func (r *Reconciler) cleanupStaleRecords(
-	ctx context.Context,
-	service *v1.Service,
-	currentID, currentZoneID, currentDomain string,
-) {
-	for _, rec := range r.cacheOwnedBy(service.Namespace, service.Name) {
-		if rec.ID == currentID && rec.ZoneID == currentZoneID && rec.Name == currentDomain {
-			continue
-		}
-		log.Info().Msgf("[DNS] [%s] Cleaning up stale record %s", service.Name, rec.Name)
 		r.deleteRecordOrRetry(ctx, service.Name, rec)
 	}
 }

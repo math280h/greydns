@@ -1033,3 +1033,103 @@ func TestHandleAnnotations_TTLOverrideDriftTriggersUpdate(t *testing.T) {
 		t.Fatalf("TTL drift not reconciled: got %d, want 900", snap[0].TTL)
 	}
 }
+
+func TestHandleAnnotations_MultipleDomainsCreateAll(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	s := svc(dnsAnnotations(testZoneName, "a.example.com, b.example.com,c.example.com"))
+	r.HandleAnnotations(context.Background(), s)
+
+	names := map[string]bool{}
+	for _, rec := range provider.Snapshot() {
+		names[rec.Name] = true
+	}
+	for _, want := range []string{"a.example.com", "b.example.com", "c.example.com"} {
+		if !names[want] {
+			t.Fatalf("missing %s in provider, got %v", want, names)
+		}
+	}
+	if r.CacheLen() != 3 {
+		t.Fatalf("cache should have 3 records, has %d", r.CacheLen())
+	}
+}
+
+func TestHandleAnnotations_DedupesDomainsInAnnotation(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	s := svc(dnsAnnotations(testZoneName, "a.example.com,a.example.com, a.example.com"))
+	r.HandleAnnotations(context.Background(), s)
+
+	if len(provider.Snapshot()) != 1 {
+		t.Fatalf("duplicated domain should produce one record, got %d", len(provider.Snapshot()))
+	}
+}
+
+func TestHandleUpdates_AddsNewDomainKeepsExisting(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	oldSvc := svc(dnsAnnotations(testZoneName, "a.example.com"))
+	r.HandleAnnotations(context.Background(), oldSvc)
+	if len(provider.Snapshot()) != 1 {
+		t.Fatalf("initial create failed, have %d records", len(provider.Snapshot()))
+	}
+
+	newSvc := svc(dnsAnnotations(testZoneName, "a.example.com,b.example.com"))
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	names := map[string]bool{}
+	for _, rec := range provider.Snapshot() {
+		names[rec.Name] = true
+	}
+	if !names["a.example.com"] || !names["b.example.com"] {
+		t.Fatalf("expected both records, got %v", names)
+	}
+}
+
+func TestHandleUpdates_DroppedDomainGetsCleanedUp(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	oldSvc := svc(dnsAnnotations(testZoneName, "a.example.com,b.example.com"))
+	r.HandleAnnotations(context.Background(), oldSvc)
+	if len(provider.Snapshot()) != 2 {
+		t.Fatalf("initial create failed, have %d records", len(provider.Snapshot()))
+	}
+
+	newSvc := svc(dnsAnnotations(testZoneName, "a.example.com"))
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	snap := provider.Snapshot()
+	if len(snap) != 1 || snap[0].Name != "a.example.com" {
+		t.Fatalf("expected only a.example.com, got %+v", snap)
+	}
+}
+
+func TestHandleUpdates_ContestedNewDomainPreservesOldRecords(t *testing.T) {
+	// Regression: if one of the new domains is owned by a peer, the
+	// reconciler must NOT delete the old records while the rename is
+	// blocked. Otherwise the Service loses DNS entirely because of a
+	// misconfiguration elsewhere.
+	r, provider, _ := setupTest(t)
+
+	oldSvc := svc(dnsAnnotations(testZoneName, "a.example.com"))
+	r.HandleAnnotations(context.Background(), oldSvc)
+
+	// Seed a peer-owned record at the new target name.
+	r.SeedCache(dnsprovider.Record{
+		ID:       "peer-id",
+		ZoneID:   testZoneID,
+		Name:     "b.example.com",
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, "peer"),
+	})
+
+	newSvc := svc(dnsAnnotations(testZoneName, "b.example.com"))
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	names := map[string]bool{}
+	for _, rec := range provider.Snapshot() {
+		names[rec.Name] = true
+	}
+	if !names["a.example.com"] {
+		t.Fatalf("a.example.com should be preserved when rename target is contested, got %v", names)
+	}
+}
