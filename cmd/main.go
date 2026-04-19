@@ -2,8 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -17,6 +24,7 @@ import (
 	"github.com/math280h/greydns/internal/controller"
 	"github.com/math280h/greydns/internal/dnsprovider"
 	"github.com/math280h/greydns/internal/dnsprovider/registry"
+	"github.com/math280h/greydns/internal/health"
 	_ "github.com/math280h/greydns/internal/providers" // registers all DNS provider factories
 	"github.com/math280h/greydns/internal/records"
 	"github.com/math280h/greydns/internal/utils"
@@ -24,57 +32,58 @@ import (
 
 func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}) //nolint:reassign // Required for logging
+	if err := run(); err != nil {
+		log.Fatal().Err(err).Msg("[Core] greydns exited with error")
+	}
+}
+
+func run() error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// Health server goes up first so kubelet probes can reach /healthz
+	// while slow initialisation (cache warm-up, provider build) is
+	// still running. /readyz stays 503 until ready.Store(true) below.
+	// If the health server exits unexpectedly (e.g. bind failure) we
+	// cancel the run ctx so the rest of startup bails out instead of
+	// continuing without probes.
+	var ready atomic.Bool
+	healthSrv := health.New(health.DefaultAddr, ready.Load)
+	healthDone := make(chan error, 1)
+	go func() {
+		err := healthSrv.Run(ctx)
+		healthDone <- err
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, http.ErrServerClosed) {
+			cancel()
+		}
+	}()
 
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
-		log.Fatal().Err(err).Msg("[Core] Failed to get cluster config")
+		return fmt.Errorf("get cluster config: %w", err)
 	}
-
 	clientset, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("[Core] Failed to create clientset")
+		return fmt.Errorf("create clientset: %w", err)
 	}
 
 	cfg.LoadConfigMap(clientset)
-
-	secret, err := clientset.CoreV1().Secrets("default").Get(context.Background(), "greydns-secret", metav1.GetOptions{})
+	secret, err := clientset.CoreV1().Secrets("default").Get(ctx, "greydns-secret", metav1.GetOptions{})
 	if err != nil {
-		log.Fatal().Err(err).Msg("[Core] Failed to get secret")
+		return fmt.Errorf("get greydns-secret: %w", err)
 	}
 
 	utils.StartBroadcaster(clientset)
 
-	providerName := cfg.ProviderName()
-	provider, err := registry.Build(
-		providerName,
-		registry.NewProviderConfig(providerName, cfg.Data()),
-		secret.Data,
-	)
-	if err != nil {
-		log.Fatal().Err(err).Str("provider", providerName).Msg("[Core] Failed to build provider")
-	}
-	log.Info().Str("provider", provider.Name()).Msg("[Core] DNS provider ready")
-
+	provider := mustBuildProvider(secret.Data)
 	ttl := mustAtoi(cfg.GetRequiredConfigValue("record-ttl"), "record-ttl")
-	refreshSeconds := mustAtoi(cfg.GetRequiredConfigValue("cache-refresh-seconds"), "cache-refresh-seconds")
-	if refreshSeconds <= 0 {
-		log.Fatal().
-			Int("cache-refresh-seconds", refreshSeconds).
-			Msg("[Core] cache-refresh-seconds must be greater than 0")
-	}
-	refreshInterval := time.Duration(refreshSeconds) * time.Second
+	refreshInterval := mustRefreshInterval()
+	recordType := mustRecordType(provider)
 
-	recordType := dnsprovider.RecordType(cfg.GetRequiredConfigValue("record-type"))
-	if typeErr := dnsprovider.ValidateRecordType(recordType, provider.SupportedRecordTypes()); typeErr != nil {
-		log.Fatal().Err(typeErr).Str("provider", provider.Name()).Msg("[Core] record-type rejected by provider")
-	}
-
-	ctx := context.Background()
 	zoneNameToID := mustListZones(ctx, provider)
-
 	initialCache, refreshErr := refreshCache(ctx, provider, zoneNameToID)
 	if refreshErr != nil {
-		log.Fatal().Err(refreshErr).Msg("[Core] Initial cache refresh failed")
+		return fmt.Errorf("initial cache refresh: %w", refreshErr)
 	}
 
 	reconciler := records.NewReconciler(
@@ -86,24 +95,67 @@ func main() {
 	)
 	reconciler.ReplaceCache(initialCache)
 
-	go runRefreshLoop(ctx, provider, zoneNameToID, reconciler, refreshInterval)
-
-	stopCh := make(chan struct{})
 	ctrl := controller.New(clientset, reconciler)
-	if startErr := ctrl.Start(ctx, stopCh); startErr != nil {
-		close(stopCh)
-		log.Fatal().Err(startErr).Msg("[Core] Failed to start controller")
+	if startErr := ctrl.Start(ctx); startErr != nil {
+		return fmt.Errorf("start controller: %w", startErr)
 	}
-	defer close(stopCh)
 
-	select {}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runRefreshLoop(ctx, provider, zoneNameToID, reconciler, refreshInterval)
+	}()
+
+	ready.Store(true)
+	log.Info().Msg("[Core] greydns is ready")
+
+	<-ctx.Done()
+	log.Info().Msg("[Core] Shutdown signal received; draining")
+
+	ready.Store(false)
+	wg.Wait()
+	if healthErr := <-healthDone; healthErr != nil && !errors.Is(healthErr, context.Canceled) {
+		log.Error().Err(healthErr).Msg("[Health] Server exited with error")
+	}
+	log.Info().Msg("[Core] Shutdown complete")
+	return nil
 }
 
-// refreshAttemptBudget caps the number of back-to-back refresh attempts
-// per tick. In a busy cluster handler writes can race the snapshot and
-// cause ReplaceCacheIfUnchanged to skip repeatedly; we retry to avoid
-// starving out-of-band updates entirely, but bound the retries so a
-// sustained write storm can't spin the goroutine indefinitely.
+func mustBuildProvider(secretData map[string][]byte) dnsprovider.Provider {
+	providerName := cfg.ProviderName()
+	provider, err := registry.Build(
+		providerName,
+		registry.NewProviderConfig(providerName, cfg.Data()),
+		secretData,
+	)
+	if err != nil {
+		log.Fatal().Err(err).Str("provider", providerName).Msg("[Core] Failed to build provider")
+	}
+	log.Info().Str("provider", provider.Name()).Msg("[Core] DNS provider ready")
+	return provider
+}
+
+func mustRefreshInterval() time.Duration {
+	seconds := mustAtoi(cfg.GetRequiredConfigValue("cache-refresh-seconds"), "cache-refresh-seconds")
+	if seconds <= 0 {
+		log.Fatal().
+			Int("cache-refresh-seconds", seconds).
+			Msg("[Core] cache-refresh-seconds must be greater than 0")
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func mustRecordType(provider dnsprovider.Provider) dnsprovider.RecordType {
+	rt := dnsprovider.RecordType(cfg.GetRequiredConfigValue("record-type"))
+	if err := dnsprovider.ValidateRecordType(rt, provider.SupportedRecordTypes()); err != nil {
+		log.Fatal().Err(err).Str("provider", provider.Name()).Msg("[Core] record-type rejected by provider")
+	}
+	return rt
+}
+
+// refreshAttemptBudget bounds per-tick retries when handler writes
+// race the snapshot, so a busy cluster can't spin the goroutine.
 const refreshAttemptBudget = 3
 
 func runRefreshLoop(
@@ -115,9 +167,14 @@ func runRefreshLoop(
 ) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		reconciler.DrainDeleteRetries(ctx)
-		refreshOnce(ctx, provider, zoneNameToID, reconciler)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconciler.DrainDeleteRetries(ctx)
+			refreshOnce(ctx, provider, zoneNameToID, reconciler)
+		}
 	}
 }
 
@@ -128,9 +185,11 @@ func refreshOnce(
 	reconciler *records.Reconciler,
 ) {
 	for attempt := 1; attempt <= refreshAttemptBudget; attempt++ {
-		// Capture the mutation generation before the network round-trip
-		// so any handler write that lands while refresh is in flight is
-		// detected and we avoid clobbering it.
+		if ctx.Err() != nil {
+			return
+		}
+		// Capture writeGen before the round-trip so handler writes
+		// landing during refresh cause a retry instead of a clobber.
 		gen := reconciler.WriteGen()
 		next, err := refreshCache(ctx, provider, zoneNameToID)
 		if err != nil {
@@ -167,11 +226,8 @@ func mustListZones(ctx context.Context, provider dnsprovider.Provider) map[strin
 	return out
 }
 
-// refreshCache rebuilds the cache snapshot by listing owned records
-// across every managed zone. It returns an error if any zone fails to
-// list: the caller must then keep the previous cache rather than swap
-// in a partial view, which would cause the controller to "forget"
-// records and incorrectly try to recreate or leak them.
+// refreshCache fails the whole snapshot if any zone errors; a partial
+// snapshot would make the controller "forget" records and leak them.
 func refreshCache(
 	ctx context.Context,
 	provider dnsprovider.Provider,

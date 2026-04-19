@@ -8,7 +8,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -20,43 +22,59 @@ import (
 	"github.com/math280h/greydns/internal/records"
 )
 
-// DefaultResyncPeriod is the informer's resync interval. k8s clients
-// re-deliver Add events at this cadence so the controller can recover
-// if it ever misses one.
+// DefaultResyncPeriod is the informer's resync interval. k8s re-delivers
+// Add events at this cadence so the controller recovers if it misses one.
 const DefaultResyncPeriod = 30 * time.Second
 
-// Controller subscribes to Service events and dispatches them to a
-// records.Reconciler. It is not safe for concurrent Start calls.
 type Controller struct {
 	clientset    kubernetes.Interface
 	reconciler   *records.Reconciler
 	factory      informers.SharedInformerFactory
 	resyncPeriod time.Duration
+
+	readyOnce sync.Once
+	ready     chan struct{}
 }
 
-// New returns a Controller that watches every namespace.
 func New(clientset kubernetes.Interface, reconciler *records.Reconciler) *Controller {
 	return &Controller{
 		clientset:    clientset,
 		reconciler:   reconciler,
 		resyncPeriod: DefaultResyncPeriod,
+		ready:        make(chan struct{}),
 	}
 }
 
-// Start registers the Service event handlers, starts the informer
-// factory, and blocks until caches have synced. Events dispatched
-// after Start returns run on the informer goroutine. stopCh halts
-// the informer when closed.
-func (c *Controller) Start(ctx context.Context, stopCh <-chan struct{}) error {
+// Start registers event handlers and blocks until caches have synced.
+// The informer stops when ctx is cancelled.
+func (c *Controller) Start(ctx context.Context) error {
 	c.factory = informers.NewSharedInformerFactory(c.clientset, c.resyncPeriod)
 	serviceInformer := c.factory.Core().V1().Services().Informer()
 
 	if _, err := serviceInformer.AddEventHandler(c.eventHandlers(ctx)); err != nil {
 		return fmt.Errorf("controller: add event handler: %w", err)
 	}
-	c.factory.Start(stopCh)
-	c.factory.WaitForCacheSync(stopCh)
+	c.factory.Start(ctx.Done())
+	for _, ok := range c.factory.WaitForCacheSync(ctx.Done()) {
+		if ok {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("controller: cache sync cancelled: %w", err)
+		}
+		return errors.New("controller: cache sync failed")
+	}
+	c.readyOnce.Do(func() { close(c.ready) })
 	return nil
+}
+
+func (c *Controller) Ready() bool {
+	select {
+	case <-c.ready:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Controller) eventHandlers(ctx context.Context) cache.ResourceEventHandlerFuncs {
@@ -96,9 +114,8 @@ func (c *Controller) eventHandlers(ctx context.Context) cache.ResourceEventHandl
 	}
 }
 
-// AnnotationsChanged returns true when any greydns.io/* key differs
-// between the two Services, including additions (present only on new)
-// and removals (present only on old).
+// AnnotationsChanged also catches additions and removals, not just
+// in-place value changes.
 func AnnotationsChanged(service, oldService *v1.Service) bool {
 	for _, key := range records.AnnotationKeys {
 		if service.Annotations[key] != oldService.Annotations[key] {
@@ -108,10 +125,9 @@ func AnnotationsChanged(service, oldService *v1.Service) bool {
 	return false
 }
 
-// extractServiceFromDelete unwraps a DeleteFunc argument. client-go
-// delivers either a *v1.Service or a cache.DeletedFinalStateUnknown
-// tombstone when the informer missed the delete event; both must be
-// handled or owned DNS records leak.
+// extractServiceFromDelete also unwraps DeletedFinalStateUnknown
+// tombstones, which client-go sends when the informer missed the raw
+// delete; ignoring them would leak records.
 func extractServiceFromDelete(obj interface{}) *v1.Service {
 	if svc, ok := obj.(*v1.Service); ok {
 		return svc
