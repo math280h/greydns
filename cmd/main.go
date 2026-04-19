@@ -114,6 +114,8 @@ func runRefreshLoop(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
+		reconciler.DrainDeleteRetries(ctx)
+
 		// Capture the mutation generation before the network round-trip
 		// so any handler writes that land while refresh is in flight
 		// will be detected and keep us from clobbering them.

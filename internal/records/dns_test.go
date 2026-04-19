@@ -73,7 +73,7 @@ func TestHandleAnnotations_CreatesRecord(t *testing.T) {
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleAnnotations(context.Background(), s)
 
-	rec, ok := r.CacheRecord(testZoneID, testDomain)
+	rec, ok := r.CacheRecord(testZoneID, testDomain, "")
 	if !ok {
 		t.Fatal("expected record in cache after create")
 	}
@@ -116,7 +116,7 @@ func TestHandleAnnotations_SkipsWhenZoneMissing(t *testing.T) {
 func TestHandleAnnotations_DuplicateDomainEmitsEvent(t *testing.T) {
 	r, provider, recorder := setupTest(t)
 
-	r.SeedCache(testZoneID, testDomain, dnsprovider.Record{
+	r.SeedCache(dnsprovider.Record{
 		ID:       "existing",
 		ZoneID:   testZoneID,
 		Name:     testDomain,
@@ -147,15 +147,15 @@ func TestHandleAnnotations_CleansUpStaleOwnedRecord(t *testing.T) {
 		Name:     "old.example.com",
 		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
 	})
-	r.SeedCache(testZoneID, "old.example.com", stale)
+	r.SeedCache(stale)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleAnnotations(context.Background(), s)
 
-	if _, ok := r.CacheRecord(testZoneID, "old.example.com"); ok {
+	if _, ok := r.CacheRecord(testZoneID, "old.example.com", ""); ok {
 		t.Fatal("stale record should have been removed from cache")
 	}
-	if _, ok := r.CacheRecord(testZoneID, testDomain); !ok {
+	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); !ok {
 		t.Fatal("new record should be in cache")
 	}
 	snap := provider.Snapshot()
@@ -178,17 +178,17 @@ func TestHandleUpdates_UpdatesExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
-	r.SeedCache(testZoneID, testDomain, existing)
+	r.SeedCache(existing)
 
 	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(testZoneName, "new.example.com"))
 
 	r.HandleUpdates(context.Background(), newSvc, oldSvc)
 
-	if _, ok := r.CacheRecord(testZoneID, testDomain); ok {
+	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); ok {
 		t.Fatal("old domain should be removed from cache")
 	}
-	updated, ok := r.CacheRecord(testZoneID, "new.example.com")
+	updated, ok := r.CacheRecord(testZoneID, "new.example.com", "")
 	if !ok {
 		t.Fatal("new domain should be in cache")
 	}
@@ -208,7 +208,7 @@ func TestHandleUpdates_CreatesFreshWhenOldAnnotationsAbsent(t *testing.T) {
 
 	r.HandleUpdates(context.Background(), newSvc, oldSvc)
 
-	if _, ok := r.CacheRecord(testZoneID, testDomain); !ok {
+	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); !ok {
 		t.Fatal("expected fresh record to be created when old annotations are absent")
 	}
 	if len(provider.Snapshot()) != 1 {
@@ -228,7 +228,7 @@ func TestHandleUpdates_SkipsWhenCacheMissDespiteOldAnnotations(t *testing.T) {
 
 	r.HandleUpdates(context.Background(), newSvc, oldSvc)
 
-	if _, ok := r.CacheRecord(testZoneID, testDomain); ok {
+	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); ok {
 		t.Fatal("should not have created a record on cache miss with old annotations present")
 	}
 	if len(provider.Snapshot()) != 0 {
@@ -239,7 +239,7 @@ func TestHandleUpdates_SkipsWhenCacheMissDespiteOldAnnotations(t *testing.T) {
 func TestHandleUpdates_RefusesToUpdateOtherServicesRecord(t *testing.T) {
 	r, provider, recorder := setupTest(t)
 
-	r.SeedCache(testZoneID, testDomain, dnsprovider.Record{
+	r.SeedCache(dnsprovider.Record{
 		ID:       "other-id",
 		ZoneID:   testZoneID,
 		Name:     testDomain,
@@ -278,12 +278,12 @@ func TestHandleDeletions_DeletesOwnedRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
-	r.SeedCache(testZoneID, testDomain, existing)
+	r.SeedCache(existing)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleDeletions(context.Background(), s)
 
-	if _, ok := r.CacheRecord(testZoneID, testDomain); ok {
+	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); ok {
 		t.Fatal("record should be removed from cache")
 	}
 	if len(provider.Snapshot()) != 0 {
@@ -299,12 +299,12 @@ func TestHandleDeletions_NoopOnForeignRecord(t *testing.T) {
 		Name:     testDomain,
 		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
 	})
-	r.SeedCache(testZoneID, testDomain, existing)
+	r.SeedCache(existing)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	r.HandleDeletions(context.Background(), s)
 
-	if _, ok := r.CacheRecord(testZoneID, testDomain); !ok {
+	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); !ok {
 		t.Fatal("foreign record should remain in cache")
 	}
 	if len(provider.Snapshot()) != 1 {
@@ -328,12 +328,12 @@ func TestHandleDeletions_WorksWhenDNSDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
-	r.SeedCache(testZoneID, testDomain, existing)
+	r.SeedCache(existing)
 
 	s := svc(map[string]string{records.AnnotationDNS: "false"})
 	r.HandleDeletions(context.Background(), s)
 
-	if _, ok := r.CacheRecord(testZoneID, testDomain); ok {
+	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); ok {
 		t.Fatal("record should be removed from cache")
 	}
 	if len(provider.Snapshot()) != 0 {
@@ -357,7 +357,7 @@ func TestHandleDeletions_WorksWhenAnnotationsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
-	r.SeedCache(testZoneID, testDomain, existing)
+	r.SeedCache(existing)
 
 	s := svc(nil)
 	r.HandleDeletions(context.Background(), s)
@@ -428,7 +428,7 @@ func TestHandleUpdates_RenameOntoOtherOwnerEmitsEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed mine: %v", err)
 	}
-	r.SeedCache(testZoneID, testDomain, mine)
+	r.SeedCache(mine)
 
 	const foreignDomain = "foreign.example.com"
 	foreign, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
@@ -442,7 +442,7 @@ func TestHandleUpdates_RenameOntoOtherOwnerEmitsEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed foreign: %v", err)
 	}
-	r.SeedCache(testZoneID, foreignDomain, foreign)
+	r.SeedCache(foreign)
 
 	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(testZoneName, foreignDomain))
@@ -458,12 +458,12 @@ func TestHandleUpdates_RenameOntoOtherOwnerEmitsEvent(t *testing.T) {
 		t.Fatal("expected DuplicateDomain event, got none")
 	}
 	// Foreign record untouched.
-	stillForeign, ok := r.CacheRecord(testZoneID, foreignDomain)
+	stillForeign, ok := r.CacheRecord(testZoneID, foreignDomain, "")
 	if !ok || stillForeign.OwnerRef != dnsprovider.OwnerRefFor(testNS, "other") {
 		t.Fatal("foreign record should still be owned by the other service")
 	}
 	// Original record still in place (rename aborted).
-	if _, intact := r.CacheRecord(testZoneID, testDomain); !intact {
+	if _, intact := r.CacheRecord(testZoneID, testDomain, ""); !intact {
 		t.Fatal("original record should be intact after rename abort")
 	}
 }
@@ -499,7 +499,7 @@ func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
-	r.SeedCache(testZoneID, testDomain, existing)
+	r.SeedCache(existing)
 
 	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(otherZoneName, testDomain))
@@ -513,14 +513,102 @@ func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
 	if snap[0].ZoneID != otherZoneID {
 		t.Fatalf("expected record to live in %q, got %q", otherZoneID, snap[0].ZoneID)
 	}
-	cached, ok := r.CacheRecord(otherZoneID, testDomain)
+	cached, ok := r.CacheRecord(otherZoneID, testDomain, "")
 	if !ok {
 		t.Fatal("migrated record should be in cache under the new zone")
 	}
 	if cached.ZoneID != otherZoneID {
 		t.Fatalf("cached record zone = %q, want %q", cached.ZoneID, otherZoneID)
 	}
-	if _, still := r.CacheRecord(testZoneID, testDomain); still {
+	if _, still := r.CacheRecord(testZoneID, testDomain, ""); still {
 		t.Fatal("old-zone record should have been removed from cache")
+	}
+}
+
+func TestCache_PreservesDuplicateNamesInSameZone(t *testing.T) {
+	// Regression: multiple records at the same (zoneID, name) - e.g. a
+	// pair of round-robin A records - must coexist in the cache.
+	// Previously the map was keyed by (zoneID, name) and the second
+	// record silently overwrote the first.
+	r, _, _ := setupTest(t)
+
+	r.SeedCache(dnsprovider.Record{
+		ID:       "rec-1",
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Content:  "1.1.1.1",
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+	r.SeedCache(dnsprovider.Record{
+		ID:       "rec-2",
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Content:  "2.2.2.2",
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+
+	if r.CacheLen() != 2 {
+		t.Fatalf("expected both duplicates in cache, have %d", r.CacheLen())
+	}
+}
+
+type rigOnDelete struct {
+	*fake.Provider
+	failDeletesOnce map[string]bool
+}
+
+func (p *rigOnDelete) DeleteRecord(ctx context.Context, zoneID, id string) error {
+	if p.failDeletesOnce[id] {
+		delete(p.failDeletesOnce, id)
+		return errForTest("transient provider failure")
+	}
+	return p.Provider.DeleteRecord(ctx, zoneID, id)
+}
+
+type stubError string
+
+func (e stubError) Error() string { return string(e) }
+
+func errForTest(s string) error { return stubError(s) }
+
+func TestHandleDeletions_RetriesFailedDeletes(t *testing.T) {
+	// Regression: a DeleteRecord failure must queue the record for
+	// retry by the refresh loop rather than leak silently.
+	stubRecorder(t)
+	base := fake.New(dnsprovider.Zone{ID: testZoneID, Name: testZoneName})
+	rigged := &rigOnDelete{Provider: base, failDeletesOnce: map[string]bool{}}
+	r := records.NewReconciler(
+		rigged,
+		map[string]string{testZoneName: testZoneID},
+		testIngress,
+		60,
+		dnsprovider.RecordTypeA,
+	)
+
+	existing, err := base.CreateRecord(context.Background(), dnsprovider.Record{
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Type:     dnsprovider.RecordTypeA,
+		Content:  testIngress,
+		TTL:      60,
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+	r.SeedCache(existing)
+	rigged.failDeletesOnce[existing.ID] = true
+
+	r.HandleDeletions(context.Background(), svc(dnsAnnotations(testZoneName, testDomain)))
+
+	// First attempt failed, record is still in provider but out of cache.
+	if len(base.Snapshot()) != 1 {
+		t.Fatalf("provider should still hold the record after failed delete, has %d", len(base.Snapshot()))
+	}
+
+	r.DrainDeleteRetries(context.Background())
+
+	if len(base.Snapshot()) != 0 {
+		t.Fatalf("retry drain should have removed the record, provider has %d", len(base.Snapshot()))
 	}
 }
