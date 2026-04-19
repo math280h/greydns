@@ -5,6 +5,7 @@ package health
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -47,26 +48,26 @@ func New(addr string, ready ReadyFunc) *Server {
 // cancellation both probes flip to 503 so kubelet stops routing traffic
 // while in-flight requests drain.
 func (s *Server) Run(ctx context.Context) error {
+	lis, err := net.Listen("tcp", s.srv.Addr)
+	if err != nil {
+		return err
+	}
+	log.Info().Str("addr", lis.Addr().String()).Msg("[Health] HTTP server listening")
+
 	errCh := make(chan error, 1)
-	go func() {
-		log.Info().Str("addr", s.srv.Addr).Msg("[Health] HTTP server listening")
-		errCh <- s.srv.ListenAndServe()
-	}()
+	go func() { errCh <- s.srv.Serve(lis) }()
 
 	select {
 	case <-ctx.Done():
 		s.healthy.Store(false)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), readyShutdownTimeout)
 		defer cancel()
-		if err := s.srv.Shutdown(shutdownCtx); err != nil {
-			return err
-		}
-		return nil
-	case err := <-errCh:
-		if errors.Is(err, http.ErrServerClosed) {
+		return s.srv.Shutdown(shutdownCtx)
+	case serveErr := <-errCh:
+		if errors.Is(serveErr, http.ErrServerClosed) {
 			return nil
 		}
-		return err
+		return serveErr
 	}
 }
 

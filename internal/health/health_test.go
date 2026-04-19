@@ -22,11 +22,13 @@ func freeAddr(t *testing.T) string {
 	return addr
 }
 
+var testClient = &http.Client{Timeout: 500 * time.Millisecond} //nolint:gochecknoglobals // test-only
+
 func waitForServer(t *testing.T, url string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(url)
+		resp, err := testClient.Get(url)
 		if err == nil {
 			resp.Body.Close()
 			return
@@ -38,7 +40,7 @@ func waitForServer(t *testing.T, url string) {
 
 func doGet(t *testing.T, url string) int {
 	t.Helper()
-	resp, err := http.Get(url)
+	resp, err := testClient.Get(url)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}

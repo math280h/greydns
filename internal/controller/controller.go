@@ -8,7 +8,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -30,7 +32,8 @@ type Controller struct {
 	factory      informers.SharedInformerFactory
 	resyncPeriod time.Duration
 
-	ready chan struct{}
+	readyOnce sync.Once
+	ready     chan struct{}
 }
 
 func New(clientset kubernetes.Interface, reconciler *records.Reconciler) *Controller {
@@ -52,8 +55,16 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("controller: add event handler: %w", err)
 	}
 	c.factory.Start(ctx.Done())
-	c.factory.WaitForCacheSync(ctx.Done())
-	close(c.ready)
+	for _, ok := range c.factory.WaitForCacheSync(ctx.Done()) {
+		if ok {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("controller: cache sync cancelled: %w", err)
+		}
+		return errors.New("controller: cache sync failed")
+	}
+	c.readyOnce.Do(func() { close(c.ready) })
 	return nil
 }
 

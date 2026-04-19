@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -43,10 +44,19 @@ func run() error {
 	// Health server goes up first so kubelet probes can reach /healthz
 	// while slow initialisation (cache warm-up, provider build) is
 	// still running. /readyz stays 503 until ready.Store(true) below.
+	// If the health server exits unexpectedly (e.g. bind failure) we
+	// cancel the run ctx so the rest of startup bails out instead of
+	// continuing without probes.
 	var ready atomic.Bool
 	healthSrv := health.New(health.DefaultAddr, ready.Load)
 	healthDone := make(chan error, 1)
-	go func() { healthDone <- healthSrv.Run(ctx) }()
+	go func() {
+		err := healthSrv.Run(ctx)
+		healthDone <- err
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, http.ErrServerClosed) {
+			cancel()
+		}
+	}()
 
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
