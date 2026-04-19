@@ -80,6 +80,24 @@ var (
 		Name:      "cache_refresh_last_success_timestamp_seconds",
 		Help:      "Unix timestamp of the last successful cache refresh.",
 	})
+
+	WorkqueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: subsystem,
+		Name:      "workqueue_depth",
+		Help:      "Items currently waiting in the reconcile workqueue.",
+	})
+
+	WorkqueueAdds = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: subsystem,
+		Name:      "workqueue_adds_total",
+		Help:      "Total items added to the reconcile workqueue.",
+	})
+
+	WorkqueueRetries = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: subsystem,
+		Name:      "workqueue_retries_total",
+		Help:      "Total reconcile attempts that failed and were requeued.",
+	})
 )
 
 // Register attaches the /metrics endpoint to mux using the default

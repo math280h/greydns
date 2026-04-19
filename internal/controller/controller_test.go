@@ -329,3 +329,53 @@ func TestController_MultipleDomainsCreateAll(t *testing.T) {
 		return names["one.example.com"] && names["two.example.com"]
 	})
 }
+
+// firstCreateFails wraps a fake.Provider and makes the first CreateRecord
+// call fail; subsequent calls succeed. Used to prove the workqueue
+// retries failed reconciles with backoff.
+type firstCreateFails struct {
+	*fake.Provider
+	failsRemaining int
+}
+
+func (p *firstCreateFails) CreateRecord(ctx context.Context, rec dnsprovider.Record) (dnsprovider.Record, error) {
+	if p.failsRemaining > 0 {
+		p.failsRemaining--
+		return dnsprovider.Record{}, context.DeadlineExceeded
+	}
+	return p.Provider.CreateRecord(ctx, rec)
+}
+
+func TestController_WorkqueueRetriesOnProviderError(t *testing.T) {
+	clientset := kfake.NewSimpleClientset()
+	base := fake.New(dnsprovider.Zone{ID: itZoneID, Name: itZoneName})
+	prov := &firstCreateFails{Provider: base, failsRemaining: 1}
+	reconciler := records.NewReconciler(
+		prov,
+		map[string]string{itZoneName: itZoneID},
+		itIngressDst,
+		60,
+		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("", false),
+	)
+	recorder := krecord.NewFakeRecorder(32)
+	prev := utils.Recorder
+	utils.Recorder = recorder //nolint:reassign // test stubs the event recorder
+	t.Cleanup(func() { utils.Recorder = prev }) //nolint:reassign // restore
+
+	ctrl := controller.New(clientset, reconciler)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := ctrl.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	svc := newService(itSvcName, dnsOn())
+	if _, err := clientset.CoreV1().Services(itNamespace).Create(ctx, svc, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	eventually(t, "record eventually created after retry", func() bool {
+		return len(base.Snapshot()) == 1
+	})
+}
