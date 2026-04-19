@@ -1,27 +1,22 @@
-# Use a minimal base image with Go
-FROM golang:1.24 as builder
+# syntax=docker/dockerfile:1.7
+FROM golang:1.24 AS builder
 
-# Set the working directory
-WORKDIR /app
+WORKDIR /src
 
-# Copy Go module files and download dependencies
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy the source code
 COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/controller ./cmd
 
-# Build the controller binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o controller cmd/main.go
+FROM gcr.io/distroless/static:nonroot
 
-# Use a lightweight base image
-FROM alpine:latest
+COPY --from=builder /out/controller /controller
 
-# Set the working directory in the final image
-WORKDIR /root/
+USER 65532:65532
+EXPOSE 8080
 
-# Copy the compiled binary from the builder
-COPY --from=builder /app/controller .
-
-# Run the controller
-CMD ["./controller"]
+ENTRYPOINT ["/controller"]
