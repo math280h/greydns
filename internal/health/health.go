@@ -22,6 +22,7 @@ type ReadyFunc func() bool
 
 type Server struct {
 	srv     *http.Server
+	mux     *http.ServeMux
 	ready   ReadyFunc
 	healthy atomic.Bool
 }
@@ -32,17 +33,21 @@ func New(addr string, ready ReadyFunc) *Server {
 	s := &Server{ready: ready}
 	s.healthy.Store(true)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/readyz", s.handleReadyz)
+	s.mux = http.NewServeMux()
+	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	s.mux.HandleFunc("/readyz", s.handleReadyz)
 
 	s.srv = &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	return s
 }
+
+// Mux exposes the underlying ServeMux so callers can attach extra
+// routes (for example /metrics) on the same port as the probes.
+func (s *Server) Mux() *http.ServeMux { return s.mux }
 
 // Run blocks until ctx is cancelled or the server errors. On
 // cancellation both probes flip to 503 so kubelet stops routing traffic

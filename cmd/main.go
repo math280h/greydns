@@ -25,6 +25,7 @@ import (
 	"github.com/math280h/greydns/internal/dnsprovider"
 	"github.com/math280h/greydns/internal/dnsprovider/registry"
 	"github.com/math280h/greydns/internal/health"
+	"github.com/math280h/greydns/internal/metrics"
 	_ "github.com/math280h/greydns/internal/providers" // registers all DNS provider factories
 	"github.com/math280h/greydns/internal/records"
 	"github.com/math280h/greydns/internal/utils"
@@ -49,6 +50,7 @@ func run() error {
 	// continuing without probes.
 	var ready atomic.Bool
 	healthSrv := health.New(health.DefaultAddr, ready.Load)
+	metrics.Register(healthSrv.Mux())
 	healthDone := make(chan error, 1)
 	go func() {
 		err := healthSrv.Run(ctx)
@@ -215,7 +217,7 @@ func mustAtoi(raw, name string) int {
 }
 
 func mustListZones(ctx context.Context, provider dnsprovider.Provider) map[string]string {
-	zones, err := provider.ListZones(ctx)
+	zones, err := listZones(ctx, provider)
 	if err != nil {
 		log.Fatal().Err(err).Msg("[Core] Failed to list zones")
 	}
@@ -235,10 +237,11 @@ func refreshCache(
 	provider dnsprovider.Provider,
 	zones map[string]string,
 ) (map[records.CacheKey]dnsprovider.Record, error) {
+	start := time.Now()
 	out := records.NewCacheSnapshot()
 	total := 0
 	for _, id := range zones {
-		recs, err := provider.ListOwnedRecords(ctx, id)
+		recs, err := listOwnedRecords(ctx, provider, id)
 		if err != nil {
 			return nil, err
 		}
@@ -249,6 +252,26 @@ func refreshCache(
 			log.Debug().Msgf("[Core] Refresh found record: %s (ID: %s)", rec.Name, rec.ID)
 		}
 	}
+	metrics.CacheRefreshDuration.Observe(time.Since(start).Seconds())
+	metrics.CacheRefreshLastSuccess.SetToCurrentTime()
 	log.Info().Msgf("[Core] Refresh found %d records", total)
 	return out, nil
+}
+
+func listOwnedRecords(
+	ctx context.Context,
+	provider dnsprovider.Provider,
+	zoneID string,
+) ([]dnsprovider.Record, error) {
+	var err error
+	defer metrics.ObserveProviderCall(provider.Name(), metrics.OpListOwned)(&err)
+	out, err := provider.ListOwnedRecords(ctx, zoneID)
+	return out, err
+}
+
+func listZones(ctx context.Context, provider dnsprovider.Provider) ([]dnsprovider.Zone, error) {
+	var err error
+	defer metrics.ObserveProviderCall(provider.Name(), metrics.OpListZones)(&err)
+	out, err := provider.ListZones(ctx)
+	return out, err
 }

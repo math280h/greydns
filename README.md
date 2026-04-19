@@ -27,6 +27,7 @@ flowchart LR
 - **Central Ingress**: Works with centrally managed ingress controllers
 - **Real-time Updates**: Automatically syncs DNS records when annotations change
 - **Lightweight**: Minimal resource footprint with efficient caching
+- **Observable**: Prometheus metrics exposed on `/metrics` alongside the health probes on port `8080`
 
 ## 📦 Supported DNS Providers
 
@@ -151,6 +152,20 @@ Universal DNS concepts live at the top level so they're not duplicated across pr
 | `cloudflare.proxy-enabled` | Default proxy setting (`true`/`false`). Overridable per Service via `greydns.io/cloudflare-proxied`. | No (default `false`) |
 
 Secret keys: `cloudflare-token`.
+
+## 📊 Metrics
+
+Prometheus metrics are served on `GET /metrics` on the same port (`8080`) as the health probes.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `greydns_reconciles_total` | counter | `outcome` | Reconciliations grouped by outcome: `created`, `updated`, `noop`, `duplicate_domain`, `invalid_annotation`, `skipped_stale_cache`, `error`. |
+| `greydns_provider_calls_total` | counter | `provider`, `operation`, `outcome` | Provider API calls; `operation` is one of `list_zones`, `list_owned`, `create`, `update`, `delete`; `outcome` is `success` or `error`. |
+| `greydns_provider_call_duration_seconds` | histogram | `provider`, `operation` | Provider API call latency. |
+| `greydns_cache_records` | gauge | - | Number of DNS records currently in the controller cache. |
+| `greydns_retry_queue_depth` | gauge | - | Number of failed deletes pending retry. |
+| `greydns_cache_refresh_duration_seconds` | histogram | - | Background cache-refresh latency. |
+| `greydns_cache_refresh_last_success_timestamp_seconds` | gauge | - | Unix timestamp of the last successful cache refresh. |
 
 ## 🤔 Why Not ExternalDNS?
 
