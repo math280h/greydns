@@ -27,6 +27,27 @@ const (
 //nolint:gochecknoglobals // immutable shared data
 var AnnotationKeys = []string{AnnotationDNS, AnnotationZone, AnnotationDomain}
 
+// CacheKey identifies a record in the cache. Keying by zone + name
+// (instead of name alone) avoids silent collisions when overlapping
+// hosted zones legitimately host the same FQDN (e.g. "example.com" and
+// "sub.example.com" both holding a record named "sub.example.com").
+type CacheKey struct {
+	ZoneID string
+	Name   string
+}
+
+// BuildCacheEntry returns the canonical cache key for a record. Used by
+// the background refresh goroutine when composing a fresh snapshot.
+func BuildCacheEntry(rec dnsprovider.Record) (CacheKey, dnsprovider.Record) {
+	return CacheKey{ZoneID: rec.ZoneID, Name: rec.Name}, rec
+}
+
+// NewCacheSnapshot returns an empty cache snapshot suitable for
+// populating via BuildCacheEntry and handing to ReplaceCache.
+func NewCacheSnapshot() map[CacheKey]dnsprovider.Record {
+	return make(map[CacheKey]dnsprovider.Record)
+}
+
 // Reconciler carries the shared state every handler needs and runtime
 // settings that are fixed at startup. Informer callbacks invoke its
 // HandleAnnotations / HandleUpdates / HandleDeletions methods.
@@ -43,12 +64,10 @@ type Reconciler struct {
 	RecordType         dnsprovider.RecordType
 
 	mu    sync.Mutex
-	cache map[string]dnsprovider.Record
+	cache map[CacheKey]dnsprovider.Record
 }
 
-// NewReconciler returns a Reconciler with its cache initialised. Zero
-// Reconciler values won't work: the internal map needs to exist before
-// the first cache touch.
+// NewReconciler returns a Reconciler with its cache initialised.
 func NewReconciler(
 	provider dnsprovider.Provider,
 	zoneNameToID map[string]string,
@@ -62,27 +81,26 @@ func NewReconciler(
 		IngressDestination: ingressDestination,
 		RecordTTL:          recordTTL,
 		RecordType:         recordType,
-		cache:              make(map[string]dnsprovider.Record),
+		cache:              make(map[CacheKey]dnsprovider.Record),
 	}
 }
 
-// ReplaceCache atomically swaps the cache contents. Used by the
-// background refresh goroutine after a successful full refresh.
-func (r *Reconciler) ReplaceCache(next map[string]dnsprovider.Record) {
+// ReplaceCache atomically swaps the cache contents.
+func (r *Reconciler) ReplaceCache(next map[CacheKey]dnsprovider.Record) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cache = next
 }
 
 // SeedCache inserts a record into the cache. Intended for tests and
-// initial bootstrapping; informer handlers use the unexported setter.
-func (r *Reconciler) SeedCache(name string, rec dnsprovider.Record) {
-	r.cacheSet(name, rec)
+// initial bootstrapping.
+func (r *Reconciler) SeedCache(zoneID, name string, rec dnsprovider.Record) {
+	r.cacheSet(CacheKey{ZoneID: zoneID, Name: name}, rec)
 }
 
-// CacheRecord looks up a cached record by name.
-func (r *Reconciler) CacheRecord(name string) (dnsprovider.Record, bool) {
-	return r.cacheGet(name)
+// CacheRecord looks up a cached record by zone and name.
+func (r *Reconciler) CacheRecord(zoneID, name string) (dnsprovider.Record, bool) {
+	return r.cacheGet(CacheKey{ZoneID: zoneID, Name: name})
 }
 
 // CacheLen returns the number of cached records.
@@ -92,31 +110,30 @@ func (r *Reconciler) CacheLen() int {
 	return len(r.cache)
 }
 
-func (r *Reconciler) cacheGet(name string) (dnsprovider.Record, bool) {
+func (r *Reconciler) cacheGet(k CacheKey) (dnsprovider.Record, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rec, ok := r.cache[name]
+	rec, ok := r.cache[k]
 	return rec, ok
 }
 
-func (r *Reconciler) cacheSet(name string, rec dnsprovider.Record) {
+func (r *Reconciler) cacheSet(k CacheKey, rec dnsprovider.Record) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.cache == nil {
-		r.cache = make(map[string]dnsprovider.Record)
+		r.cache = make(map[CacheKey]dnsprovider.Record)
 	}
-	r.cache[name] = rec
+	r.cache[k] = rec
 }
 
-func (r *Reconciler) cacheDelete(name string) {
+func (r *Reconciler) cacheDelete(k CacheKey) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.cache, name)
+	delete(r.cache, k)
 }
 
 // cacheOwnedBy returns a snapshot of every cached record whose OwnerRef
-// matches (namespace, name). The snapshot is safe to iterate while
-// mutating the cache from the same goroutine.
+// matches (namespace, name).
 func (r *Reconciler) cacheOwnedBy(namespace, name string) []dnsprovider.Record {
 	owner := dnsprovider.OwnerRefFor(namespace, name)
 	r.mu.Lock()
@@ -139,8 +156,7 @@ func ownedBy(rec dnsprovider.Record, service *v1.Service) bool {
 }
 
 // preflight validates the greydns annotations on service and resolves
-// its zone. Returns (zoneID, domain, true) on success, or ("", "",
-// false) to indicate the handler should no-op.
+// its zone. Returns (zoneID, domain, true) on success.
 func (r *Reconciler) preflight(service *v1.Service) (string, string, bool) {
 	if !dnsEnabled(service) {
 		return "", "", false
@@ -191,7 +207,8 @@ func (r *Reconciler) HandleAnnotations(ctx context.Context, service *v1.Service)
 		return
 	}
 
-	existing, exists := r.cacheGet(domain)
+	key := CacheKey{ZoneID: zoneID, Name: domain}
+	existing, exists := r.cacheGet(key)
 
 	if exists {
 		if !ownedBy(existing, service) {
@@ -199,7 +216,7 @@ func (r *Reconciler) HandleAnnotations(ctx context.Context, service *v1.Service)
 			return
 		}
 		log.Debug().Msgf("[DNS] [%s] Record exists", service.Name)
-		r.cleanupStaleRecords(ctx, service, domain)
+		r.cleanupStaleRecords(ctx, service, zoneID, domain)
 		return
 	}
 
@@ -217,8 +234,8 @@ func (r *Reconciler) HandleAnnotations(ctx context.Context, service *v1.Service)
 		return
 	}
 	log.Info().Msgf("[DNS] [%s] Record created", service.Name)
-	r.cacheSet(domain, created)
-	r.cleanupStaleRecords(ctx, service, domain)
+	r.cacheSet(key, created)
+	r.cleanupStaleRecords(ctx, service, zoneID, domain)
 }
 
 func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.Service) {
@@ -228,7 +245,12 @@ func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.
 	}
 
 	oldDomain := oldService.Annotations[AnnotationDomain]
-	existing, exists := r.cacheGet(oldDomain)
+	oldZoneID, haveOldZoneID := r.ZoneNameToID[oldService.Annotations[AnnotationZone]]
+	var existing dnsprovider.Record
+	exists := false
+	if haveOldZoneID && oldDomain != "" {
+		existing, exists = r.cacheGet(CacheKey{ZoneID: oldZoneID, Name: oldDomain})
+	}
 	if !exists {
 		log.Info().Msgf("[DNS] [%s] Old record missing, creating fresh", service.Name)
 		r.HandleAnnotations(ctx, service)
@@ -240,11 +262,11 @@ func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.
 	}
 
 	// Zone change: the existing record lives in existing.ZoneID, which
-	// may not equal the zoneID we just resolved from the new annotation.
+	// may differ from the zoneID resolved from the new annotation.
 	// Record IDs are zone-scoped, so an in-place update would target
 	// the wrong zone. Create the replacement in the new zone first;
-	// only delete the old-zone record once the new one is confirmed,
-	// so a create failure leaves the service still resolving.
+	// only delete the old-zone record once the new one is confirmed so
+	// a create failure leaves the Service still resolving.
 	if existing.ZoneID != zoneID {
 		log.Info().Msgf("[DNS] [%s] Zone changed, migrating record", service.Name)
 		created, createErr := r.Provider.CreateRecord(ctx, dnsprovider.Record{
@@ -260,14 +282,12 @@ func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.
 			return
 		}
 		if delErr := r.Provider.DeleteRecord(ctx, existing.ZoneID, existing.ID); delErr != nil {
-			// Replacement is live; log the orphan and continue. A
-			// future cleanupStaleRecords pass will retry the delete.
 			log.Error().Err(delErr).Msgf("[DNS] [%s] Failed to delete record in old zone after migration", service.Name)
+		} else {
+			r.cacheDelete(CacheKey{ZoneID: existing.ZoneID, Name: oldDomain})
 		}
-		if oldDomain != newDomain {
-			r.cacheDelete(oldDomain)
-		}
-		r.cacheSet(newDomain, created)
+		r.cacheSet(CacheKey{ZoneID: zoneID, Name: newDomain}, created)
+		r.cleanupStaleRecords(ctx, service, zoneID, newDomain)
 		return
 	}
 
@@ -287,16 +307,16 @@ func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.
 	}
 	log.Info().Msgf("[DNS] [%s] Record updated", service.Name)
 	if oldDomain != newDomain {
-		r.cacheDelete(oldDomain)
+		r.cacheDelete(CacheKey{ZoneID: existing.ZoneID, Name: oldDomain})
 	}
-	r.cacheSet(newDomain, updated)
+	r.cacheSet(CacheKey{ZoneID: zoneID, Name: newDomain}, updated)
+	r.cleanupStaleRecords(ctx, service, zoneID, newDomain)
 }
 
 // HandleDeletions removes every cached record owned by the deleted
-// service. It does not consult current annotations because a Service
-// may be deleted after greydns.io/dns was set to "false" or a zone
-// annotation was removed; driving cleanup from the cache prevents
-// those records from being leaked.
+// service, ignoring current annotations so records aren't leaked when
+// the Service is deleted after DNS was disabled or annotations were
+// removed.
 func (r *Reconciler) HandleDeletions(ctx context.Context, service *v1.Service) {
 	owned := r.cacheOwnedBy(service.Namespace, service.Name)
 	if len(owned) == 0 {
@@ -310,23 +330,22 @@ func (r *Reconciler) HandleDeletions(ctx context.Context, service *v1.Service) {
 			continue
 		}
 		log.Info().Msgf("[DNS] [%s] Deleted record %s", service.Name, rec.Name)
-		r.cacheDelete(rec.Name)
+		r.cacheDelete(CacheKey{ZoneID: rec.ZoneID, Name: rec.Name})
 	}
 }
 
 // cleanupStaleRecords deletes any cached records still owned by service
-// whose name differs from currentDomain. Handles the rename case: a
-// service updates its greydns.io/domain annotation without greydns
-// processing the intermediate delete. Each record is deleted in its
-// own zone (rec.ZoneID), which may differ from the service's current
-// zone if the service migrated zones and left records behind.
+// whose (zone, name) differs from the current (zoneID, currentDomain).
+// Handles rename and zone-migration residue from prior failed
+// reconciles. Each record is deleted in its own zone.
 func (r *Reconciler) cleanupStaleRecords(
 	ctx context.Context,
 	service *v1.Service,
+	currentZoneID string,
 	currentDomain string,
 ) {
 	for _, rec := range r.cacheOwnedBy(service.Namespace, service.Name) {
-		if rec.Name == currentDomain {
+		if rec.ZoneID == currentZoneID && rec.Name == currentDomain {
 			continue
 		}
 		log.Info().Msgf("[DNS] [%s] Cleaning up stale record %s", service.Name, rec.Name)
@@ -334,6 +353,6 @@ func (r *Reconciler) cleanupStaleRecords(
 			log.Error().Err(err).Msgf("[DNS] [%s] Failed to delete stale record", service.Name)
 			continue
 		}
-		r.cacheDelete(rec.Name)
+		r.cacheDelete(CacheKey{ZoneID: rec.ZoneID, Name: rec.Name})
 	}
 }

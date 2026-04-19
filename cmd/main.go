@@ -195,27 +195,30 @@ func mustListZones(ctx context.Context, provider dnsprovider.Provider) map[strin
 	return out
 }
 
-// refreshCache rebuilds the domain-keyed record cache by listing owned
-// records across every managed zone. It returns an error if any zone
-// fails to list: the caller must then keep the previous cache rather
-// than swap in a partial view, which would cause the controller to
-// "forget" records and incorrectly try to recreate or leak them.
+// refreshCache rebuilds the cache snapshot by listing owned records
+// across every managed zone. It returns an error if any zone fails to
+// list: the caller must then keep the previous cache rather than swap
+// in a partial view, which would cause the controller to "forget"
+// records and incorrectly try to recreate or leak them.
 func refreshCache(
 	ctx context.Context,
 	provider dnsprovider.Provider,
 	zones map[string]string,
-) (map[string]dnsprovider.Record, error) {
-	out := make(map[string]dnsprovider.Record)
+) (map[records.CacheKey]dnsprovider.Record, error) {
+	out := records.NewCacheSnapshot()
+	total := 0
 	for _, id := range zones {
 		recs, err := provider.ListOwnedRecords(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		for _, r := range recs {
-			out[r.Name] = r
-			log.Debug().Msgf("[Core] Refresh found record: %s (ID: %s)", r.Name, r.ID)
+		for _, rec := range recs {
+			key, value := records.BuildCacheEntry(rec)
+			out[key] = value
+			total++
+			log.Debug().Msgf("[Core] Refresh found record: %s (ID: %s)", rec.Name, rec.ID)
 		}
 	}
-	log.Info().Msgf("[Core] Refresh found %d records", len(out))
+	log.Info().Msgf("[Core] Refresh found %d records", total)
 	return out, nil
 }

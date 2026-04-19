@@ -193,8 +193,6 @@ func (p *Provider) fromResponse(zoneID string, resp *dns.RecordResponse) dnsprov
 	}
 }
 
-// parseOwner extracts the greydns owner ref from a Cloudflare record
-// comment, or returns ("", false) if the comment isn't a greydns marker.
 func parseOwner(comment string) (string, bool) {
 	if !strings.HasPrefix(comment, commentMarker) {
 		return "", false
