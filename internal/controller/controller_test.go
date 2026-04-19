@@ -297,7 +297,8 @@ func TestController_PerServiceTTLTriggersUpdate(t *testing.T) {
 	})
 
 	svc.Annotations[records.AnnotationTTL] = "900"
-	if _, updateErr := rig.clientset.CoreV1().Services(itNamespace).Update(ctx, svc, metav1.UpdateOptions{}); updateErr != nil {
+	_, updateErr := rig.clientset.CoreV1().Services(itNamespace).Update(ctx, svc, metav1.UpdateOptions{})
+	if updateErr != nil {
 		t.Fatalf("update: %v", updateErr)
 	}
 
