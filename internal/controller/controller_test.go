@@ -34,7 +34,6 @@ type itRig struct {
 	clientset *kfake.Clientset
 	provider  *fake.Provider
 	recorder  *krecord.FakeRecorder
-	stopCh    chan struct{}
 }
 
 func newRig(t *testing.T) *itRig {
@@ -56,19 +55,19 @@ func newRig(t *testing.T) *itRig {
 	})
 
 	ctrl := controller.New(clientset, reconciler)
-	stopCh := make(chan struct{})
-	if err := ctrl.Start(context.Background(), stopCh); err != nil {
-		close(stopCh)
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := ctrl.Start(ctx); err != nil {
+		cancel()
 		t.Fatalf("controller.Start: %v", err)
 	}
-	t.Cleanup(func() {
-		close(stopCh)
-	})
+	t.Cleanup(cancel)
+	if !ctrl.Ready() {
+		t.Fatal("controller should report ready after Start")
+	}
 	return &itRig{
 		clientset: clientset,
 		provider:  provider,
 		recorder:  recorder,
-		stopCh:    stopCh,
 	}
 }
 
