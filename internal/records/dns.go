@@ -53,9 +53,13 @@ func NewCacheSnapshot() map[CacheKey]dnsprovider.Record {
 // HandleAnnotations / HandleUpdates / HandleDeletions methods.
 //
 // The record cache is guarded by mu; the background refresh goroutine
-// replaces it wholesale while informer handlers concurrently read/write
-// entries. External callers must go through ReplaceCache / SeedCache /
-// CacheRecord / CacheLen rather than touching the map directly.
+// swaps it wholesale while informer handlers concurrently read/write
+// entries. To prevent the refresh from clobbering handler writes that
+// landed during the network round-trip, every mutation bumps writeGen
+// and ReplaceCacheIfUnchanged only swaps when writeGen is unchanged
+// since the refresh snapshot was captured. External callers go through
+// ReplaceCache / ReplaceCacheIfUnchanged / SeedCache / CacheRecord /
+// CacheLen rather than touching the map directly.
 type Reconciler struct {
 	Provider           dnsprovider.Provider
 	ZoneNameToID       map[string]string
@@ -63,8 +67,9 @@ type Reconciler struct {
 	RecordTTL          int
 	RecordType         dnsprovider.RecordType
 
-	mu    sync.Mutex
-	cache map[CacheKey]dnsprovider.Record
+	mu       sync.Mutex
+	cache    map[CacheKey]dnsprovider.Record
+	writeGen uint64
 }
 
 // NewReconciler returns a Reconciler with its cache initialised.
@@ -85,11 +90,36 @@ func NewReconciler(
 	}
 }
 
-// ReplaceCache atomically swaps the cache contents.
+// ReplaceCache atomically swaps the cache contents. Intended for the
+// initial cache load at startup; the background refresh goroutine
+// should use ReplaceCacheIfUnchanged to avoid clobbering handler writes.
 func (r *Reconciler) ReplaceCache(next map[CacheKey]dnsprovider.Record) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cache = next
+}
+
+// WriteGen returns the current cache mutation generation. The refresh
+// goroutine captures this before snapshotting the provider and passes
+// it back to ReplaceCacheIfUnchanged.
+func (r *Reconciler) WriteGen() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.writeGen
+}
+
+// ReplaceCacheIfUnchanged swaps the cache to next only when no handler
+// has mutated the cache since genAtStart was captured. Returns true on
+// swap, false if the refresh was outraced by a handler and should be
+// skipped.
+func (r *Reconciler) ReplaceCacheIfUnchanged(next map[CacheKey]dnsprovider.Record, genAtStart uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.writeGen != genAtStart {
+		return false
+	}
+	r.cache = next
+	return true
 }
 
 // SeedCache inserts a record into the cache. Intended for tests and
@@ -124,12 +154,14 @@ func (r *Reconciler) cacheSet(k CacheKey, rec dnsprovider.Record) {
 		r.cache = make(map[CacheKey]dnsprovider.Record)
 	}
 	r.cache[k] = rec
+	r.writeGen++
 }
 
 func (r *Reconciler) cacheDelete(k CacheKey) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.cache, k)
+	r.writeGen++
 }
 
 // cacheOwnedBy returns a snapshot of every cached record whose OwnerRef
@@ -238,6 +270,59 @@ func (r *Reconciler) HandleAnnotations(ctx context.Context, service *v1.Service)
 	r.cleanupStaleRecords(ctx, service, zoneID, domain)
 }
 
+// resolveUpdateExisting looks up the record an Update should mutate.
+// Returns (record, true) when the caller may proceed with
+// update/migrate, (_, false) when the caller must stop (event already
+// emitted or deliberate skip to avoid a duplicate create).
+//
+// The function also handles the rename/migrate destination-ownership
+// check so HandleUpdates itself stays at manageable complexity.
+func (r *Reconciler) resolveUpdateExisting(
+	service *v1.Service,
+	oldZoneID, oldDomain, newZoneID, newDomain string,
+) (dnsprovider.Record, bool) {
+	existing, exists := r.cacheGet(CacheKey{ZoneID: oldZoneID, Name: oldDomain})
+	if !exists {
+		// Cache miss despite the old Service having greydns
+		// annotations. The cache is likely stale. The record may
+		// already live at the new destination; if it does and we
+		// own it, treat that as the existing record. Otherwise skip
+		// rather than create: the provider may still hold the
+		// original and a fresh create would duplicate.
+		dest, destExists := r.cacheGet(CacheKey{ZoneID: newZoneID, Name: newDomain})
+		switch {
+		case destExists && ownedBy(dest, service):
+			return dest, true
+		case destExists:
+			emitDuplicateDomain(service)
+			return dnsprovider.Record{}, false
+		default:
+			log.Warn().Msgf(
+				"[DNS] [%s] Expected record missing from cache; skipping to avoid a duplicate create",
+				service.Name,
+			)
+			return dnsprovider.Record{}, false
+		}
+	}
+	if !ownedBy(existing, service) {
+		emitDuplicateDomain(service)
+		return dnsprovider.Record{}, false
+	}
+
+	// Rename or migration: if the destination key is different and
+	// already owned by a peer, abort so a Service can't take over
+	// another's domain by mutating its annotations. In-place updates
+	// (same zone, same name) skip this check.
+	if existing.ZoneID != newZoneID || oldDomain != newDomain {
+		dest, destExists := r.cacheGet(CacheKey{ZoneID: newZoneID, Name: newDomain})
+		if destExists && !ownedBy(dest, service) {
+			emitDuplicateDomain(service)
+			return dnsprovider.Record{}, false
+		}
+	}
+	return existing, true
+}
+
 func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.Service) {
 	zoneID, newDomain, ok := r.preflight(service)
 	if !ok {
@@ -246,33 +331,19 @@ func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.
 
 	oldDomain := oldService.Annotations[AnnotationDomain]
 	oldZoneID, haveOldZoneID := r.ZoneNameToID[oldService.Annotations[AnnotationZone]]
-	var existing dnsprovider.Record
-	exists := false
-	if haveOldZoneID && oldDomain != "" {
-		existing, exists = r.cacheGet(CacheKey{ZoneID: oldZoneID, Name: oldDomain})
-	}
-	if !exists {
-		log.Info().Msgf("[DNS] [%s] Old record missing, creating fresh", service.Name)
+
+	// If the old Service had no greydns identity, this Update is
+	// effectively the first time we see the record and creation is
+	// correct.
+	if !haveOldZoneID || oldDomain == "" {
+		log.Info().Msgf("[DNS] [%s] Old record absent, creating fresh", service.Name)
 		r.HandleAnnotations(ctx, service)
 		return
 	}
-	if !ownedBy(existing, service) {
-		emitDuplicateDomain(service)
-		return
-	}
 
-	// Rename or migration: the destination differs from the current
-	// cache entry. If some other Service already owns (zoneID,
-	// newDomain), abort so a Service can't take over a peer's domain
-	// by mutating its annotations. In-place updates (same zone, same
-	// name) skip this check because they modify the record we already
-	// own.
-	movingKey := existing.ZoneID != zoneID || oldDomain != newDomain
-	if movingKey {
-		if dest, destExists := r.cacheGet(CacheKey{ZoneID: zoneID, Name: newDomain}); destExists && !ownedBy(dest, service) {
-			emitDuplicateDomain(service)
-			return
-		}
+	existing, found := r.resolveUpdateExisting(service, oldZoneID, oldDomain, zoneID, newDomain)
+	if !found {
+		return
 	}
 
 	// Zone change: the existing record lives in existing.ZoneID, which

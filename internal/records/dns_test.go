@@ -197,16 +197,42 @@ func TestHandleUpdates_UpdatesExisting(t *testing.T) {
 	}
 }
 
-func TestHandleUpdates_FallsThroughWhenOldMissing(t *testing.T) {
-	r, _, _ := setupTest(t)
+func TestHandleUpdates_CreatesFreshWhenOldAnnotationsAbsent(t *testing.T) {
+	// Update events where the old Service had no greydns identity
+	// (e.g. DNS was just enabled, or the annotation was just added)
+	// should create fresh.
+	r, provider, _ := setupTest(t)
+
+	oldSvc := svc(nil)
+	newSvc := svc(dnsAnnotations(testZoneName, testDomain))
+
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	if _, ok := r.CacheRecord(testZoneID, testDomain); !ok {
+		t.Fatal("expected fresh record to be created when old annotations are absent")
+	}
+	if len(provider.Snapshot()) != 1 {
+		t.Fatalf("provider should hold the newly-created record, has %d", len(provider.Snapshot()))
+	}
+}
+
+func TestHandleUpdates_SkipsWhenCacheMissDespiteOldAnnotations(t *testing.T) {
+	// Regression: if the old Service had greydns annotations but the
+	// cache lacks the record (e.g. a stale refresh), HandleUpdates
+	// must not create a fresh record; the provider may still hold it
+	// and a fresh create would duplicate.
+	r, provider, _ := setupTest(t)
 
 	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(testZoneName, testDomain))
 
 	r.HandleUpdates(context.Background(), newSvc, oldSvc)
 
-	if _, ok := r.CacheRecord(testZoneID, testDomain); !ok {
-		t.Fatal("expected fresh record to be created via fall-through")
+	if _, ok := r.CacheRecord(testZoneID, testDomain); ok {
+		t.Fatal("should not have created a record on cache miss with old annotations present")
+	}
+	if len(provider.Snapshot()) != 0 {
+		t.Fatalf("provider should be untouched, has %d records", len(provider.Snapshot()))
 	}
 }
 

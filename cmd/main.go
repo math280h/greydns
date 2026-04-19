@@ -114,12 +114,18 @@ func runRefreshLoop(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
+		// Capture the mutation generation before the network round-trip
+		// so any handler writes that land while refresh is in flight
+		// will be detected and keep us from clobbering them.
+		gen := reconciler.WriteGen()
 		next, err := refreshCache(ctx, provider, zoneNameToID)
 		if err != nil {
 			log.Error().Err(err).Msg("[Core] Cache refresh failed; keeping previous cache")
 			continue
 		}
-		reconciler.ReplaceCache(next)
+		if !reconciler.ReplaceCacheIfUnchanged(next, gen) {
+			log.Info().Msg("[Core] Cache mutated during refresh; skipping this cycle")
+		}
 	}
 }
 
