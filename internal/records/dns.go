@@ -18,10 +18,10 @@ import (
 	"github.com/math280h/greydns/internal/utils"
 )
 
-// ErrReconcileIncomplete signals that a reconcile left at least one
-// provider call unresolved (DuplicateDomain blocks, stale-cache skips,
-// or a transient provider error). The caller should requeue with
-// backoff; the next attempt will re-evaluate from fresh state.
+// ErrReconcileIncomplete signals a non-terminal reconcile result: a
+// DuplicateDomain block on another Service or a transient provider
+// error. Callers requeue with backoff; the next attempt re-evaluates
+// from fresh state.
 var ErrReconcileIncomplete = errors.New("reconcile incomplete")
 
 const (

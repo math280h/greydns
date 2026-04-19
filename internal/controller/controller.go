@@ -40,6 +40,7 @@ type Controller struct {
 
 	readyOnce sync.Once
 	ready     chan struct{}
+	workersWG sync.WaitGroup
 }
 
 func New(clientset kubernetes.Interface, reconciler *records.Reconciler) *Controller {
@@ -76,11 +77,10 @@ func (c *Controller) Start(ctx context.Context) error {
 		return errors.New("controller: cache sync failed")
 	}
 
-	var wg sync.WaitGroup
 	for range c.workers {
-		wg.Add(1)
+		c.workersWG.Add(1)
 		go func() {
-			defer wg.Done()
+			defer c.workersWG.Done()
 			c.runWorker(ctx)
 		}()
 	}
@@ -89,13 +89,15 @@ func (c *Controller) Start(ctx context.Context) error {
 		<-ctx.Done()
 		c.queue.ShutDown()
 	}()
-	go func() {
-		wg.Wait()
-		log.Info().Msg("[Core] Controller workers drained")
-	}()
 
 	c.readyOnce.Do(func() { close(c.ready) })
 	return nil
+}
+
+// Wait blocks until all workers exit. Call after ctx cancel if the
+// caller needs to tear down shared state workers still touch.
+func (c *Controller) Wait() {
+	c.workersWG.Wait()
 }
 
 func (c *Controller) Ready() bool {
@@ -167,14 +169,28 @@ func (c *Controller) processNextItem(ctx context.Context) bool {
 	defer c.queue.Done(key)
 	defer metrics.WorkqueueDepth.Set(float64(c.queue.Len()))
 
-	if err := c.reconcileKey(ctx, key); err != nil {
+	err := c.reconcileKey(ctx, key)
+	switch {
+	case err == nil:
+		c.queue.Forget(key)
+	case errors.Is(err, records.ErrReconcileIncomplete):
+		// Expected steady state: contention or a peer-owned domain.
+		// Requeue quietly; the reconcile counter already captures
+		// the granular outcome.
+		log.Info().Err(err).Str("key", key).Msg("[Core] Reconcile incomplete; requeuing")
+		c.requeue(key)
+	default:
 		metrics.WorkqueueRetries.Inc()
 		log.Error().Err(err).Str("key", key).Msg("[Core] Reconcile failed; requeuing")
-		c.queue.AddRateLimited(key)
-		return true
+		c.requeue(key)
 	}
-	c.queue.Forget(key)
 	return true
+}
+
+func (c *Controller) requeue(key string) {
+	c.queue.AddRateLimited(key)
+	metrics.WorkqueueAdds.Inc()
+	metrics.WorkqueueDepth.Set(float64(c.queue.Len()))
 }
 
 func (c *Controller) reconcileKey(ctx context.Context, key string) error {

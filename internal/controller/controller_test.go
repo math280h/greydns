@@ -51,17 +51,19 @@ func newRig(t *testing.T) *itRig {
 	recorder := krecord.NewFakeRecorder(32)
 	prev := utils.Recorder
 	utils.Recorder = recorder //nolint:reassign // integration tests stub the event recorder
-	t.Cleanup(func() {
-		utils.Recorder = prev //nolint:reassign // restore the production recorder
-	})
 
 	ctrl := controller.New(clientset, reconciler)
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := ctrl.Start(ctx); err != nil {
 		cancel()
+		utils.Recorder = prev //nolint:reassign // restore the production recorder
 		t.Fatalf("controller.Start: %v", err)
 	}
-	t.Cleanup(cancel)
+	t.Cleanup(func() {
+		cancel()
+		ctrl.Wait()
+		utils.Recorder = prev //nolint:reassign // restore the production recorder
+	})
 	if !ctrl.Ready() {
 		t.Fatal("controller should report ready after Start")
 	}
@@ -358,17 +360,21 @@ func TestController_WorkqueueRetriesOnProviderError(t *testing.T) {
 		dnsprovider.RecordTypeA,
 		records.NewOverridePolicy("", false),
 	)
-	recorder := krecord.NewFakeRecorder(32)
 	prev := utils.Recorder
-	utils.Recorder = recorder //nolint:reassign // test stubs the event recorder
-	t.Cleanup(func() { utils.Recorder = prev }) //nolint:reassign // restore
+	utils.Recorder = krecord.NewFakeRecorder(32) //nolint:reassign // test stubs the event recorder
 
 	ctrl := controller.New(clientset, reconciler)
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	if err := ctrl.Start(ctx); err != nil {
+		cancel()
+		utils.Recorder = prev //nolint:reassign // restore
 		t.Fatalf("start: %v", err)
 	}
+	t.Cleanup(func() {
+		cancel()
+		ctrl.Wait()
+		utils.Recorder = prev //nolint:reassign // restore
+	})
 
 	svc := newService(itSvcName, dnsOn())
 	if _, err := clientset.CoreV1().Services(itNamespace).Create(ctx, svc, metav1.CreateOptions{}); err != nil {
