@@ -7,12 +7,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 type RecordType string
 
 const (
 	RecordTypeA     RecordType = "A"
+	RecordTypeAAAA  RecordType = "AAAA"
 	RecordTypeCNAME RecordType = "CNAME"
 )
 
@@ -29,18 +31,21 @@ type Zone struct {
 
 // Record is a provider-neutral DNS record.
 //
-// OwnerRef carries the controller's ownership marker in the form
-// "<namespace>/<service>". Each provider persists this using whatever native
-// mechanism it has available (Cloudflare: Comment; Route53: sibling TXT;
-// GCP DNS: RRSet description; etc.).
+// OwnerRef is the controller's ownership marker "<namespace>/<service>";
+// each provider persists it natively (CF Comment, R53 shadow TXT, etc.).
+//
+// ProviderHints are provider-scoped overrides sourced from Service
+// annotations. Providers ignore unknown hints and should echo their
+// effective state back on List/Create/Update so drift can be detected.
 type Record struct {
-	ID       string
-	ZoneID   string
-	Name     string
-	Type     RecordType
-	Content  string
-	TTL      int
-	OwnerRef string
+	ID            string
+	ZoneID        string
+	Name          string
+	Type          RecordType
+	Content       string
+	TTL           int
+	OwnerRef      string
+	ProviderHints map[string]string
 }
 
 func OwnerRefFor(namespace, name string) string {
@@ -78,10 +83,8 @@ type Provider interface {
 // ValidateRecordType returns nil if t is in supported, otherwise
 // ErrUnsupportedRecordType wrapped with the offending value.
 func ValidateRecordType(t RecordType, supported []RecordType) error {
-	for _, s := range supported {
-		if s == t {
-			return nil
-		}
+	if slices.Contains(supported, t) {
+		return nil
 	}
 	return fmt.Errorf("%w: %q", ErrUnsupportedRecordType, t)
 }

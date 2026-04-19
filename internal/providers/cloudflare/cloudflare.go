@@ -1,10 +1,14 @@
 // Package cloudflare implements dnsprovider.Provider against the Cloudflare
-// DNS API. It persists greydns ownership information in the record Comment
-// field using the marker format "[greydns]owner=<namespace>/<name>".
+// DNS API. Ownership is persisted in the record Comment field with the
+// marker format "[greydns]owner=<namespace>/<name>".
 //
 // Configuration keys (ConfigMap, active when provider: cloudflare):
 //
 //	cloudflare.proxy-enabled  optional bool, default false
+//
+// Per-Service annotation overrides:
+//
+//	greydns.io/cloudflare-proxied  "true"/"false", overrides proxy-enabled
 //
 // Generic record settings (record-type, record-ttl, ingress-destination)
 // are read by the controller and passed through the dnsprovider.Record
@@ -19,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	cf "github.com/cloudflare/cloudflare-go/v4"
@@ -37,19 +42,21 @@ const (
 	// List filtering can recognise them. Anything after the "=" is the
 	// owner ref in the form "<namespace>/<name>".
 	commentMarker = "[greydns]owner="
+
+	// hintProxied is the ProviderHints key for the per-Service
+	// "greydns.io/cloudflare-proxied" override.
+	hintProxied = "proxied"
 )
 
 func init() { //nolint:gochecknoinits // required for provider self-registration
 	registry.Register(providerName, New)
 }
 
-// Provider implements dnsprovider.Provider using the Cloudflare API.
 type Provider struct {
 	api     *cf.Client
 	proxied bool
 }
 
-// New is the registry.Factory for the cloudflare provider.
 func New(cfg registry.ProviderConfig, secret map[string][]byte) (dnsprovider.Provider, error) {
 	token := string(secret["cloudflare-token"])
 	if token == "" {
@@ -68,7 +75,11 @@ func New(cfg registry.ProviderConfig, secret map[string][]byte) (dnsprovider.Pro
 func (p *Provider) Name() string { return providerName }
 
 func (p *Provider) SupportedRecordTypes() []dnsprovider.RecordType {
-	return []dnsprovider.RecordType{dnsprovider.RecordTypeA, dnsprovider.RecordTypeCNAME}
+	return []dnsprovider.RecordType{
+		dnsprovider.RecordTypeA,
+		dnsprovider.RecordTypeAAAA,
+		dnsprovider.RecordTypeCNAME,
+	}
 }
 
 func (p *Provider) ListZones(ctx context.Context) ([]dnsprovider.Zone, error) {
@@ -96,13 +107,14 @@ func (p *Provider) ListOwnedRecords(ctx context.Context, zoneID string) ([]dnspr
 			continue
 		}
 		out = append(out, dnsprovider.Record{
-			ID:       rec.ID,
-			ZoneID:   zoneID,
-			Name:     rec.Name,
-			Type:     dnsprovider.RecordType(rec.Type),
-			Content:  rec.Content,
-			TTL:      int(rec.TTL),
-			OwnerRef: owner,
+			ID:            rec.ID,
+			ZoneID:        zoneID,
+			Name:          rec.Name,
+			Type:          dnsprovider.RecordType(rec.Type),
+			Content:       rec.Content,
+			TTL:           int(rec.TTL),
+			OwnerRef:      owner,
+			ProviderHints: map[string]string{hintProxied: strconv.FormatBool(rec.Proxied)},
 		})
 	}
 	if err := iter.Err(); err != nil {
@@ -152,9 +164,11 @@ func (p *Provider) DeleteRecord(ctx context.Context, zoneID, recordID string) er
 }
 
 // buildRecordParam translates a neutral Record into the Cloudflare SDK's
-// record param union.
+// record param union. Proxy status comes from the per-Service hint when
+// set, falling back to the provider-wide default from config.
 func (p *Provider) buildRecordParam(rec dnsprovider.Record) (dns.RecordUnionParam, error) {
 	comment := commentMarker + rec.OwnerRef
+	proxied := p.resolveProxied(rec.ProviderHints)
 
 	switch rec.Type {
 	case dnsprovider.RecordTypeA:
@@ -164,7 +178,16 @@ func (p *Provider) buildRecordParam(rec dnsprovider.Record) (dns.RecordUnionPara
 			Content: cf.F(rec.Content),
 			TTL:     cf.F(dns.TTL(rec.TTL)),
 			Comment: cf.F(comment),
-			Proxied: cf.F(p.proxied),
+			Proxied: cf.F(proxied),
+		}, nil
+	case dnsprovider.RecordTypeAAAA:
+		return dns.AAAARecordParam{
+			Type:    cf.F(dns.AAAARecordType("AAAA")),
+			Name:    cf.F(rec.Name),
+			Content: cf.F(rec.Content),
+			TTL:     cf.F(dns.TTL(rec.TTL)),
+			Comment: cf.F(comment),
+			Proxied: cf.F(proxied),
 		}, nil
 	case dnsprovider.RecordTypeCNAME:
 		return dns.CNAMERecordParam{
@@ -173,40 +196,49 @@ func (p *Provider) buildRecordParam(rec dnsprovider.Record) (dns.RecordUnionPara
 			Content: cf.F(rec.Content),
 			TTL:     cf.F(dns.TTL(rec.TTL)),
 			Comment: cf.F(comment),
-			Proxied: cf.F(p.proxied),
+			Proxied: cf.F(proxied),
 		}, nil
 	default:
 		return nil, fmt.Errorf("cloudflare: %w: %q", dnsprovider.ErrUnsupportedRecordType, rec.Type)
 	}
 }
 
+func (p *Provider) resolveProxied(hints map[string]string) bool {
+	raw, ok := hints[hintProxied]
+	if !ok {
+		return p.proxied
+	}
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		return p.proxied
+	}
+	return parsed
+}
+
 func (p *Provider) fromResponse(zoneID string, resp *dns.RecordResponse) dnsprovider.Record {
 	owner, _ := parseOwner(resp.Comment)
 	return dnsprovider.Record{
-		ID:       resp.ID,
-		ZoneID:   zoneID,
-		Name:     resp.Name,
-		Type:     dnsprovider.RecordType(resp.Type),
-		Content:  resp.Content,
-		TTL:      int(resp.TTL),
-		OwnerRef: owner,
+		ID:            resp.ID,
+		ZoneID:        zoneID,
+		Name:          resp.Name,
+		Type:          dnsprovider.RecordType(resp.Type),
+		Content:       resp.Content,
+		TTL:           int(resp.TTL),
+		OwnerRef:      owner,
+		ProviderHints: map[string]string{hintProxied: strconv.FormatBool(resp.Proxied)},
 	}
 }
 
-// parseOwner extracts the greydns owner ref from a Cloudflare record
-// comment. Returns ok=false unless the comment starts with the greydns
-// marker and the suffix is a well-formed "<namespace>/<name>" pair with
-// both parts non-empty; otherwise a degenerate record (e.g. a stray
-// "[greydns]owner=") would land in the cache without matching any
-// Service and could never be cleaned up.
+// parseOwner returns ok=false unless the comment starts with the
+// greydns marker and its suffix is a non-empty "<namespace>/<name>".
 func parseOwner(comment string) (string, bool) {
-	if !strings.HasPrefix(comment, commentMarker) {
+	suffix, ok := strings.CutPrefix(comment, commentMarker)
+	if !ok {
 		return "", false
 	}
-	owner := strings.TrimPrefix(comment, commentMarker)
-	namespace, name, ok := strings.Cut(owner, "/")
-	if !ok || namespace == "" || name == "" || strings.Contains(name, "/") {
+	namespace, name, hasSlash := strings.Cut(suffix, "/")
+	if !hasSlash || namespace == "" || name == "" || strings.Contains(name, "/") {
 		return "", false
 	}
-	return owner, true
+	return suffix, true
 }

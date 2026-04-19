@@ -100,9 +100,26 @@ metadata:
     greydns.io/dns: "true"
     greydns.io/domain: "api.example.com"
     greydns.io/zone: "example.com"
+    # Optional per-Service overrides:
+    greydns.io/ttl: "300"
+    greydns.io/record-type: "AAAA"
+    greydns.io/cloudflare-proxied: "true"
 spec:
   # ... rest of service spec
 ```
+
+### Service annotations
+
+| Annotation | Required | Description |
+|------------|----------|-------------|
+| `greydns.io/dns` | Yes | Must be `"true"` for greydns to manage this Service. |
+| `greydns.io/zone` | Yes | Managed DNS zone name (must match a provider-visible zone). |
+| `greydns.io/domain` | Yes | Fully-qualified record name to create. |
+| `greydns.io/ttl` | No | Positive integer seconds. Overrides the controller-wide `record-ttl`. |
+| `greydns.io/record-type` | No | One of the provider's supported record types. Overrides `record-type`. |
+| `greydns.io/<provider>-<key>` | No | Provider-scoped override, e.g. `greydns.io/cloudflare-proxied`. |
+
+Invalid override values fall back to the controller default and surface as an `InvalidAnnotation` event on the Service. Per-Service overrides can be restricted cluster-wide via the `allowed-overrides` ConfigMap key; overrides not on the allowlist are ignored with the same event.
 
 ### Duplicate Records
 
@@ -121,16 +138,17 @@ Universal DNS concepts live at the top level so they're not duplicated across pr
 | Config Key | Description | Required |
 |------------|-------------|----------|
 | `provider` | Active provider name (today: `cloudflare`) | Yes |
-| `record-type` | DNS record type (`A`, `CNAME`, ...) | Yes |
-| `record-ttl` | DNS record time-to-live in seconds | Yes |
+| `record-type` | Default record type (`A`, `AAAA`, `CNAME`, ...). Overridable per Service via `greydns.io/record-type`. | Yes |
+| `record-ttl` | Default TTL in seconds. Overridable per Service via `greydns.io/ttl`. | Yes |
 | `cache-refresh-seconds` | Cache refresh interval | Yes |
 | `ingress-destination` | Ingress controller IP address or hostname | Yes |
+| `allowed-overrides` | Allowlist of per-Service override suffixes (CSV). Missing key or `*` allows every override; explicit empty string denies every override; otherwise only the listed suffixes (e.g. `ttl,record-type,cloudflare-proxied`) are honoured. Enforced in-process, so Service editors can't bypass it. | No (default allow all) |
 
 ### Cloudflare keys (`provider: cloudflare`)
 
 | Config Key | Description | Required |
 |------------|-------------|----------|
-| `cloudflare.proxy-enabled` | Enable Cloudflare proxy (`true`/`false`) | No (default `false`) |
+| `cloudflare.proxy-enabled` | Default proxy setting (`true`/`false`). Overridable per Service via `greydns.io/cloudflare-proxied`. | No (default `false`) |
 
 Secret keys: `cloudflare-token`.
 

@@ -86,12 +86,14 @@ func run() error {
 		return fmt.Errorf("initial cache refresh: %w", refreshErr)
 	}
 
+	overrideRaw, hasOverrideKey := cfg.Data()["allowed-overrides"]
 	reconciler := records.NewReconciler(
 		provider,
 		zoneNameToID,
 		cfg.GetRequiredConfigValue("ingress-destination"),
 		ttl,
 		recordType,
+		records.NewOverridePolicy(overrideRaw, hasOverrideKey),
 	)
 	reconciler.ReplaceCache(initialCache)
 

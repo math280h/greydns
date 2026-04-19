@@ -46,6 +46,7 @@ func newRig(t *testing.T) *itRig {
 		itIngressDst,
 		60,
 		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("", false),
 	)
 	recorder := krecord.NewFakeRecorder(32)
 	prev := utils.Recorder
@@ -276,4 +277,33 @@ func TestController_DuplicateDomainEmitsEvent(t *testing.T) {
 	if got := len(rig.provider.Snapshot()); got != 1 {
 		t.Fatalf("provider should still hold exactly one record, has %d", got)
 	}
+}
+
+func TestController_PerServiceTTLTriggersUpdate(t *testing.T) {
+	rig := newRig(t)
+	ctx := context.Background()
+
+	svc, err := rig.clientset.CoreV1().Services(itNamespace).Create(
+		ctx,
+		newService(itSvcName, dnsOn()),
+		metav1.CreateOptions{},
+	)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	eventually(t, "initial record at default TTL", func() bool {
+		snap := rig.provider.Snapshot()
+		return len(snap) == 1 && snap[0].TTL == 60
+	})
+
+	svc.Annotations[records.AnnotationTTL] = "900"
+	_, updateErr := rig.clientset.CoreV1().Services(itNamespace).Update(ctx, svc, metav1.UpdateOptions{})
+	if updateErr != nil {
+		t.Fatalf("update: %v", updateErr)
+	}
+
+	eventually(t, "TTL updated to 900", func() bool {
+		snap := rig.provider.Snapshot()
+		return len(snap) == 1 && snap[0].TTL == 900
+	})
 }

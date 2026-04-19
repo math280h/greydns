@@ -5,6 +5,8 @@ package records
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/rs/zerolog/log"
@@ -15,16 +17,13 @@ import (
 )
 
 const (
-	AnnotationDNS    = "greydns.io/dns"
-	AnnotationZone   = "greydns.io/zone"
-	AnnotationDomain = "greydns.io/domain"
+	AnnotationPrefix     = "greydns.io/"
+	AnnotationDNS        = "greydns.io/dns"
+	AnnotationZone       = "greydns.io/zone"
+	AnnotationDomain     = "greydns.io/domain"
+	AnnotationTTL        = "greydns.io/ttl"
+	AnnotationRecordType = "greydns.io/record-type"
 )
-
-// AnnotationKeys is the exhaustive set of greydns.io/* annotations the
-// controller reacts to.
-//
-//nolint:gochecknoglobals // immutable shared data
-var AnnotationKeys = []string{AnnotationDNS, AnnotationZone, AnnotationDomain}
 
 // CacheKey identifies a record in the cache. Keying by zone and the
 // provider-assigned record ID (rather than by name) lets the cache
@@ -77,12 +76,57 @@ type nameKey struct {
 // and cacheOwnedBy don't need to scan the full cache under the mutex.
 // Failed deletes are parked in deleteRetries for the refresh goroutine
 // to retry because the originating Service is usually gone by then.
+// OverridePolicy gates which per-Service annotation overrides the
+// Reconciler will honour. Platform operators opt in to each one via
+// the "allowed-overrides" ConfigMap key; the default (no key, or "*")
+// is to accept every override.
+//
+// Enforcement happens in-process: because the Reconciler is the only
+// reader of greydns annotations, no amount of k8s RBAC or Service
+// editing bypasses the policy.
+type OverridePolicy struct {
+	allowAll bool
+	allowed  map[string]struct{}
+}
+
+// NewOverridePolicy parses the raw "allowed-overrides" value. hasKey
+// distinguishes "config key absent" (default: allow all) from the
+// explicit empty string "" (deny all).
+func NewOverridePolicy(raw string, hasKey bool) OverridePolicy {
+	if !hasKey {
+		return OverridePolicy{allowAll: true}
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "*" {
+		return OverridePolicy{allowAll: true}
+	}
+	allowed := make(map[string]struct{})
+	for item := range strings.SplitSeq(trimmed, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			allowed[item] = struct{}{}
+		}
+	}
+	return OverridePolicy{allowed: allowed}
+}
+
+// Allows reports whether suffix (the part after "greydns.io/", e.g.
+// "ttl" or "cloudflare-proxied") is in the allowlist.
+func (p OverridePolicy) Allows(suffix string) bool {
+	if p.allowAll {
+		return true
+	}
+	_, ok := p.allowed[suffix]
+	return ok
+}
+
 type Reconciler struct {
 	provider           dnsprovider.Provider
 	zoneNameToID       map[string]string
 	ingressDestination string
 	recordTTL          int
 	recordType         dnsprovider.RecordType
+	overridePolicy     OverridePolicy
 
 	mu            sync.Mutex
 	cache         map[CacheKey]dnsprovider.Record
@@ -99,6 +143,7 @@ func NewReconciler(
 	ingressDestination string,
 	recordTTL int,
 	recordType dnsprovider.RecordType,
+	overridePolicy OverridePolicy,
 ) *Reconciler {
 	return &Reconciler{
 		provider:           provider,
@@ -106,6 +151,7 @@ func NewReconciler(
 		ingressDestination: ingressDestination,
 		recordTTL:          recordTTL,
 		recordType:         recordType,
+		overridePolicy:     overridePolicy,
 		cache:              make(map[CacheKey]dnsprovider.Record),
 		byName:             make(map[nameKey][]CacheKey),
 		byOwner:            make(map[string][]CacheKey),
@@ -376,22 +422,15 @@ func (r *Reconciler) HandleAnnotations(ctx context.Context, service *v1.Service)
 		return
 	}
 
-	ownerRef := dnsprovider.OwnerRefFor(service.Namespace, service.Name)
-	existing, exists := r.CacheRecord(zoneID, domain, ownerRef)
+	desired := r.desiredRecord(service, zoneID, domain)
+	existing, exists := r.CacheRecord(zoneID, domain, desired.OwnerRef)
 	if exists {
-		r.reconcileExistingRecord(ctx, service, existing, zoneID, domain, ownerRef)
+		r.reconcileExistingRecord(ctx, service, existing, desired)
 		return
 	}
 
 	log.Info().Msgf("[DNS] [%s] Record does not exist, attempting to create", service.Name)
-	created, err := r.provider.CreateRecord(ctx, dnsprovider.Record{
-		ZoneID:   zoneID,
-		Name:     domain,
-		Type:     r.recordType,
-		Content:  r.ingressDestination,
-		TTL:      r.recordTTL,
-		OwnerRef: ownerRef,
-	})
+	created, err := r.provider.CreateRecord(ctx, desired)
 	if err != nil {
 		log.Error().Err(err).Msgf("[DNS] [%s] Failed to create record", service.Name)
 		return
@@ -401,51 +440,117 @@ func (r *Reconciler) HandleAnnotations(ctx context.Context, service *v1.Service)
 	r.cleanupStaleRecords(ctx, service, created.ID, zoneID, domain)
 }
 
-// reconcileExistingRecord handles the branch of HandleAnnotations where
-// a cached record already exists at (zoneID, domain). If it's owned by
-// another Service, emit DuplicateDomain. If it's ours but has drifted
-// from desired state, update it. In all success cases, sweep stale
-// records owned by this Service.
+func (r *Reconciler) desiredRecord(service *v1.Service, zoneID, domain string) dnsprovider.Record {
+	return dnsprovider.Record{
+		ZoneID:        zoneID,
+		Name:          domain,
+		Type:          r.resolveRecordType(service),
+		Content:       r.ingressDestination,
+		TTL:           r.resolveTTL(service),
+		OwnerRef:      dnsprovider.OwnerRefFor(service.Namespace, service.Name),
+		ProviderHints: r.collectProviderHints(service),
+	}
+}
+
+func (r *Reconciler) resolveTTL(service *v1.Service) int {
+	raw := strings.TrimSpace(service.Annotations[AnnotationTTL])
+	if raw == "" {
+		return r.recordTTL
+	}
+	if !r.overridePolicy.Allows("ttl") {
+		emitInvalidAnnotation(service, AnnotationTTL+": override not in allowed-overrides")
+		return r.recordTTL
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		emitInvalidAnnotation(service, AnnotationTTL+": must be a positive integer, got "+raw)
+		return r.recordTTL
+	}
+	return v
+}
+
+func (r *Reconciler) resolveRecordType(service *v1.Service) dnsprovider.RecordType {
+	raw := strings.TrimSpace(service.Annotations[AnnotationRecordType])
+	if raw == "" {
+		return r.recordType
+	}
+	if !r.overridePolicy.Allows("record-type") {
+		emitInvalidAnnotation(service, AnnotationRecordType+": override not in allowed-overrides")
+		return r.recordType
+	}
+	candidate := dnsprovider.RecordType(raw)
+	if err := dnsprovider.ValidateRecordType(candidate, r.provider.SupportedRecordTypes()); err != nil {
+		emitInvalidAnnotation(service, AnnotationRecordType+": "+err.Error())
+		return r.recordType
+	}
+	return candidate
+}
+
+// collectProviderHints reads "greydns.io/<provider>-<key>" annotations
+// into a <key>-keyed map so the active provider sees a clean namespace.
+// Each full "<provider>-<key>" must be allowlisted.
+func (r *Reconciler) collectProviderHints(service *v1.Service) map[string]string {
+	prefix := AnnotationPrefix + r.provider.Name() + "-"
+	hints := make(map[string]string)
+	for k, v := range service.Annotations {
+		suffix, ok := strings.CutPrefix(k, prefix)
+		if !ok {
+			continue
+		}
+		policyKey := r.provider.Name() + "-" + suffix
+		if !r.overridePolicy.Allows(policyKey) {
+			emitInvalidAnnotation(service, k+": override not in allowed-overrides")
+			continue
+		}
+		hints[suffix] = v
+	}
+	if len(hints) == 0 {
+		return nil
+	}
+	return hints
+}
+
 func (r *Reconciler) reconcileExistingRecord(
 	ctx context.Context,
 	service *v1.Service,
-	existing dnsprovider.Record,
-	zoneID, domain, ownerRef string,
+	existing, desired dnsprovider.Record,
 ) {
 	if !ownedBy(existing, service) {
 		emitDuplicateDomain(service)
 		return
 	}
-	if !r.hasDrift(existing) {
+	if !hasDrift(existing, desired) {
 		log.Debug().Msgf("[DNS] [%s] Record exists and matches desired state", service.Name)
-		r.cleanupStaleRecords(ctx, service, existing.ID, zoneID, domain)
+		r.cleanupStaleRecords(ctx, service, existing.ID, desired.ZoneID, desired.Name)
 		return
 	}
 	log.Info().Msgf("[DNS] [%s] Record drift detected, updating", service.Name)
-	updated, err := r.provider.UpdateRecord(ctx, dnsprovider.Record{
-		ID:       existing.ID,
-		ZoneID:   existing.ZoneID,
-		Name:     domain,
-		Type:     r.recordType,
-		Content:  r.ingressDestination,
-		TTL:      r.recordTTL,
-		OwnerRef: ownerRef,
-	})
+	update := desired
+	update.ID = existing.ID
+	update.ZoneID = existing.ZoneID
+	updated, err := r.provider.UpdateRecord(ctx, update)
 	if err != nil {
 		log.Error().Err(err).Msgf("[DNS] [%s] Failed to update drifted record", service.Name)
 		return
 	}
 	r.cacheSet(CacheKey{ZoneID: updated.ZoneID, ID: updated.ID}, updated)
-	r.cleanupStaleRecords(ctx, service, updated.ID, zoneID, domain)
+	r.cleanupStaleRecords(ctx, service, updated.ID, desired.ZoneID, desired.Name)
 }
 
-// hasDrift reports whether an existing cached record differs from the
-// controller's desired state (record type, content, TTL). Ownership
-// and name are implied by the lookup path so they aren't compared here.
-func (r *Reconciler) hasDrift(rec dnsprovider.Record) bool {
-	return rec.Type != r.recordType ||
-		rec.Content != r.ingressDestination ||
-		rec.TTL != r.recordTTL
+// hasDrift compares fields the controller owns. Hints present only on
+// existing are provider-internal defaults and ignored.
+func hasDrift(existing, desired dnsprovider.Record) bool {
+	if existing.Type != desired.Type ||
+		existing.Content != desired.Content ||
+		existing.TTL != desired.TTL {
+		return true
+	}
+	for k, v := range desired.ProviderHints {
+		if existing.ProviderHints[k] != v {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveUpdateExisting locates the record HandleUpdates should mutate
@@ -517,6 +622,8 @@ func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.
 		return
 	}
 
+	desired := r.desiredRecord(service, zoneID, newDomain)
+
 	// Zone change: the existing record lives in existing.ZoneID, which
 	// may differ from the zoneID resolved from the new annotation.
 	// Record IDs are zone-scoped, so an in-place update would target
@@ -525,14 +632,7 @@ func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.
 	// a create failure leaves the Service still resolving.
 	if existing.ZoneID != zoneID {
 		log.Info().Msgf("[DNS] [%s] Zone changed, migrating record", service.Name)
-		created, createErr := r.provider.CreateRecord(ctx, dnsprovider.Record{
-			ZoneID:   zoneID,
-			Name:     newDomain,
-			Type:     r.recordType,
-			Content:  r.ingressDestination,
-			TTL:      r.recordTTL,
-			OwnerRef: dnsprovider.OwnerRefFor(service.Namespace, service.Name),
-		})
+		created, createErr := r.provider.CreateRecord(ctx, desired)
 		if createErr != nil {
 			log.Error().Err(createErr).Msgf("[DNS] [%s] Failed to create record in new zone", service.Name)
 			return
@@ -544,15 +644,10 @@ func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.
 	}
 
 	log.Debug().Msgf("[DNS] [%s] Updating record", service.Name)
-	updated, err := r.provider.UpdateRecord(ctx, dnsprovider.Record{
-		ID:       existing.ID,
-		ZoneID:   existing.ZoneID,
-		Name:     newDomain,
-		Type:     r.recordType,
-		Content:  r.ingressDestination,
-		TTL:      r.recordTTL,
-		OwnerRef: dnsprovider.OwnerRefFor(service.Namespace, service.Name),
-	})
+	update := desired
+	update.ID = existing.ID
+	update.ZoneID = existing.ZoneID
+	updated, err := r.provider.UpdateRecord(ctx, update)
 	if err != nil {
 		log.Error().Err(err).Msgf("[DNS] [%s] Failed to update record", service.Name)
 		return
