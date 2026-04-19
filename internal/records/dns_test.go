@@ -621,6 +621,61 @@ func TestHandleDeletions_RetriesFailedDeletes(t *testing.T) {
 	}
 }
 
+// alwaysFailingDeletes is a fake provider whose DeleteRecord always
+// returns an error; the counter records how many times drain attempts
+// to delete, which equals the retry-queue depth at drain time.
+type alwaysFailingDeletes struct {
+	*fake.Provider
+	deleteCalls int
+}
+
+func (p *alwaysFailingDeletes) DeleteRecord(_ context.Context, _, _ string) error {
+	p.deleteCalls++
+	return errForTest("provider outage")
+}
+
+func TestHandleDeletions_DedupesRepeatedEnqueues(t *testing.T) {
+	// Regression: repeated failing delete attempts for the same record
+	// must collapse into a single retry-queue entry; otherwise the
+	// queue grows unbounded under a sustained provider outage.
+	stubRecorder(t)
+	base := fake.New(dnsprovider.Zone{ID: testZoneID, Name: testZoneName})
+	prov := &alwaysFailingDeletes{Provider: base}
+	r := records.NewReconciler(
+		prov,
+		map[string]string{testZoneName: testZoneID},
+		testIngress,
+		60,
+		dnsprovider.RecordTypeA,
+	)
+
+	r.SeedCache(dnsprovider.Record{
+		ID:       "rec-1",
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Type:     dnsprovider.RecordTypeA,
+		Content:  testIngress,
+		TTL:      60,
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+
+	svcObj := svc(dnsAnnotations(testZoneName, testDomain))
+	const failedAttempts = 5
+	for range failedAttempts {
+		r.HandleDeletions(context.Background(), svcObj)
+	}
+
+	// Every HandleDeletions calls the provider once (and fails). That
+	// accounts for the first `failedAttempts` calls. DrainDeleteRetries
+	// should find exactly one pending entry regardless of the number
+	// of failures, so it makes one additional provider call.
+	prov.deleteCalls = 0
+	r.DrainDeleteRetries(context.Background())
+	if prov.deleteCalls != 1 {
+		t.Fatalf("retry queue should hold exactly one entry, drain attempted %d deletes", prov.deleteCalls)
+	}
+}
+
 func TestHandleAnnotations_ReconcilesDriftedRecord(t *testing.T) {
 	// Regression: if a cached record's content, TTL, or type diverges
 	// from desired state (e.g. ingress-destination changed in config

@@ -219,9 +219,18 @@ func (r *Reconciler) DrainDeleteRetries(ctx context.Context) {
 	}
 }
 
+// enqueueDeleteRetry appends p to the retry queue unless the same
+// (zoneID, id) is already queued. Without this, repeated reconciles
+// against a failing provider would grow the queue unbounded and
+// re-retry the same record N times per cycle.
 func (r *Reconciler) enqueueDeleteRetry(p pendingDelete) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	for _, existing := range r.deleteRetries {
+		if existing.ZoneID == p.ZoneID && existing.ID == p.ID {
+			return
+		}
+	}
 	r.deleteRetries = append(r.deleteRetries, p)
 }
 
