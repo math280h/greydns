@@ -9,14 +9,12 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
 
 	cfg "github.com/math280h/greydns/internal/config"
+	"github.com/math280h/greydns/internal/controller"
 	"github.com/math280h/greydns/internal/dnsprovider"
 	"github.com/math280h/greydns/internal/dnsprovider/registry"
 	_ "github.com/math280h/greydns/internal/providers" // registers all DNS provider factories
@@ -90,16 +88,13 @@ func main() {
 
 	go runRefreshLoop(ctx, provider, zoneNameToID, reconciler, refreshInterval)
 
-	factory := informers.NewSharedInformerFactory(clientset, 30*time.Second)
-	serviceInformer := factory.Core().V1().Services().Informer()
-
-	if _, evtErr := serviceInformer.AddEventHandler(serviceEventHandlers(ctx, reconciler)); evtErr != nil {
-		log.Fatal().Err(evtErr).Msg("[Core] Failed to add event handler")
-	}
-
 	stopCh := make(chan struct{})
+	ctrl := controller.New(clientset, reconciler)
+	if startErr := ctrl.Start(ctx, stopCh); startErr != nil {
+		close(stopCh)
+		log.Fatal().Err(startErr).Msg("[Core] Failed to start controller")
+	}
 	defer close(stopCh)
-	factory.Start(stopCh)
 
 	select {}
 }
@@ -148,76 +143,6 @@ func refreshOnce(
 		log.Info().Int("attempt", attempt).Msg("[Core] Cache mutated during refresh; retrying")
 	}
 	log.Warn().Int("budget", refreshAttemptBudget).Msg("[Core] Refresh retry budget exhausted; next tick will try again")
-}
-
-// extractServiceFromDelete unwraps a DeleteFunc argument. client-go
-// delivers either a *v1.Service or a cache.DeletedFinalStateUnknown
-// tombstone when the informer missed the delete event; both must be
-// cleaned up or owned DNS records leak.
-func extractServiceFromDelete(obj interface{}) *v1.Service {
-	if svc, ok := obj.(*v1.Service); ok {
-		return svc
-	}
-	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-	if !ok {
-		log.Error().Msg("[Core] Failed to cast object during delete")
-		return nil
-	}
-	svc, ok := tombstone.Obj.(*v1.Service)
-	if !ok {
-		log.Error().Msg("[Core] Tombstone during delete did not contain a Service")
-		return nil
-	}
-	return svc
-}
-
-func serviceEventHandlers(ctx context.Context, reconciler *records.Reconciler) cache.ResourceEventHandlerFuncs {
-	return cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			service, ok := obj.(*v1.Service)
-			if !ok {
-				log.Error().Msg("[Core] Failed to cast object")
-				return
-			}
-			reconciler.HandleAnnotations(ctx, service)
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			service, ok := newObj.(*v1.Service)
-			if !ok {
-				log.Error().Msg("[Core] Failed to cast object during update")
-				return
-			}
-			oldService, ok := oldObj.(*v1.Service)
-			if !ok {
-				log.Error().Msg("[Core] Failed to cast old object during update")
-				return
-			}
-			if !greydnsAnnotationsChanged(service, oldService) {
-				return
-			}
-			log.Info().Msgf("[Core] [%s] Annotations changed, updating records", service.Name)
-			reconciler.HandleUpdates(ctx, service, oldService)
-		},
-		DeleteFunc: func(obj interface{}) {
-			service := extractServiceFromDelete(obj)
-			if service == nil {
-				return
-			}
-			reconciler.HandleDeletions(ctx, service)
-		},
-	}
-}
-
-// greydnsAnnotationsChanged returns true when any greydns.io/* key
-// differs between the two Services, including additions (present only
-// on new) and removals (present only on old).
-func greydnsAnnotationsChanged(service, oldService *v1.Service) bool {
-	for _, key := range records.AnnotationKeys {
-		if service.Annotations[key] != oldService.Annotations[key] {
-			return true
-		}
-	}
-	return false
 }
 
 func mustAtoi(raw, name string) int {

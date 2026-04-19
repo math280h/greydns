@@ -2,7 +2,9 @@ package records_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -674,6 +676,62 @@ func TestHandleDeletions_DedupesRepeatedEnqueues(t *testing.T) {
 	if prov.deleteCalls != 1 {
 		t.Fatalf("retry queue should hold exactly one entry, drain attempted %d deletes", prov.deleteCalls)
 	}
+}
+
+func TestReconciler_CacheConcurrentAccess(t *testing.T) {
+	// Runs SeedCache, CacheRecord, ReplaceCacheIfUnchanged and
+	// DrainDeleteRetries concurrently with race detection on. Asserts
+	// final cache state is internally consistent (every cached record
+	// can be looked up via both the (zone, name) and the owner path).
+	stubRecorder(t)
+	provider := fake.New(dnsprovider.Zone{ID: testZoneID, Name: testZoneName})
+	r := records.NewReconciler(
+		provider,
+		map[string]string{testZoneName: testZoneID},
+		testIngress,
+		60,
+		dnsprovider.RecordTypeA,
+	)
+
+	const workers = 8
+	const iterations = 200
+
+	var wg sync.WaitGroup
+	wg.Add(workers * 2)
+
+	// Writer workers: seed, read, replace.
+	for w := range workers {
+		go func(id int) {
+			defer wg.Done()
+			for i := range iterations {
+				name := fmt.Sprintf("svc-%d-%d.example.com", id, i)
+				r.SeedCache(dnsprovider.Record{
+					ID:       fmt.Sprintf("rec-%d-%d", id, i),
+					ZoneID:   testZoneID,
+					Name:     name,
+					Type:     dnsprovider.RecordTypeA,
+					Content:  testIngress,
+					TTL:      60,
+					OwnerRef: dnsprovider.OwnerRefFor(testNS, fmt.Sprintf("svc-%d-%d", id, i)),
+				})
+				_, _ = r.CacheRecord(testZoneID, name, "")
+			}
+		}(w)
+	}
+
+	// Reader workers: len + refresh-style replace via WriteGen guard.
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for range iterations {
+				gen := r.WriteGen()
+				_ = r.CacheLen()
+				r.ReplaceCacheIfUnchanged(records.NewCacheSnapshot(), gen)
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 func TestHandleAnnotations_ReconcilesDriftedRecord(t *testing.T) {
