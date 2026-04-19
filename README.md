@@ -9,6 +9,18 @@ GreyDNS enables development teams to manage their DNS records directly through K
 ![Go Version](https://img.shields.io/badge/go-1.24-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
+```mermaid
+flowchart LR
+    dev([Developer]) -->|kubectl apply| svc["Service<br/>greydns.io/* annotations"]
+    subgraph k8s[Kubernetes cluster]
+        svc -->|informer event| ctrl[greydns controller]
+        cm[(ConfigMap<br/>greydns-config)] --> ctrl
+        sec[(Secret<br/>greydns-secret)] --> ctrl
+    end
+    ctrl -->|Create / Update / Delete| prov[Active DNS provider<br/>e.g. Cloudflare]
+    prov --> dns[(Public DNS record<br/>owned by greydns)]
+```
+
 ## 🚀 Features
 
 - **Annotation-Driven**: Create and manage DNS records using simple Kubernetes service annotations
