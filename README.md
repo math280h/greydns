@@ -166,6 +166,9 @@ Prometheus metrics are served on `GET /metrics` on the same port (`8080`) as the
 | `greydns_retry_queue_depth` | gauge | - | Number of failed deletes pending retry. |
 | `greydns_cache_refresh_duration_seconds` | histogram | - | Background cache-refresh latency. |
 | `greydns_cache_refresh_last_success_timestamp_seconds` | gauge | - | Unix timestamp of the last successful cache refresh. |
+| `greydns_workqueue_depth` | gauge | - | Items currently waiting in the reconcile workqueue. |
+| `greydns_workqueue_adds_total` | counter | - | Items added to the workqueue since startup. |
+| `greydns_workqueue_retries_total` | counter | - | Reconciles that failed and were requeued with backoff. |
 
 ## 🤔 Why Not ExternalDNS?
 

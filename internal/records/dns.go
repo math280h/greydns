@@ -5,6 +5,7 @@ package records
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,12 @@ import (
 	"github.com/math280h/greydns/internal/metrics"
 	"github.com/math280h/greydns/internal/utils"
 )
+
+// ErrReconcileIncomplete signals a non-terminal reconcile result: a
+// DuplicateDomain block on another Service or a transient provider
+// error. Callers requeue with backoff; the next attempt re-evaluates
+// from fresh state.
+var ErrReconcileIncomplete = errors.New("reconcile incomplete")
 
 const (
 	AnnotationPrefix     = "greydns.io/"
@@ -446,27 +453,16 @@ func emitInvalidAnnotation(service *v1.Service, detail string) {
 	metrics.Reconciles.WithLabelValues(metrics.OutcomeInvalidAnnotation).Inc()
 }
 
-func (r *Reconciler) HandleAnnotations(ctx context.Context, service *v1.Service) {
-	r.reconcile(ctx, service, nil)
-}
-
-// reconcile is the shared add/update path. oldService, when non-nil,
-// enables a stale-cache precheck: before creating or deleting anything,
-// every (zone, domain) pair the Service previously claimed must still
-// be visible in our cache. A miss means the cache is behind the
-// provider and proceeding would either create a duplicate or leak the
-// old record (since cleanup can't delete what it can't see).
-func (r *Reconciler) reconcile(ctx context.Context, service, oldService *v1.Service) {
+// Reconcile ensures the provider holds exactly one record per
+// greydns.io/domain entry on service and nothing else owned by this
+// Service. Returns ErrReconcileIncomplete when some provider call
+// could not complete so callers (the workqueue) can requeue with
+// backoff; returns nil for terminal outcomes (annotation-rejected,
+// fully reconciled) that require a new event to progress.
+func (r *Reconciler) Reconcile(ctx context.Context, service *v1.Service) error {
 	zoneID, domains, ok := r.preflight(service)
 	if !ok {
-		return
-	}
-
-	ownerRef := dnsprovider.OwnerRefFor(service.Namespace, service.Name)
-	if oldService != nil {
-		if !r.oldRecordsStillCached(service, oldService, ownerRef) {
-			return
-		}
+		return nil
 	}
 
 	desiredNames := make(map[string]struct{}, len(domains))
@@ -482,31 +478,10 @@ func (r *Reconciler) reconcile(ctx context.Context, service, oldService *v1.Serv
 	// records while a rename target is contested would leave the
 	// Service with no DNS at all.
 	if !allReconciled {
-		return
+		return ErrReconcileIncomplete
 	}
 	r.cleanupOwnedOutsideDesired(ctx, service, zoneID, desiredNames)
-}
-
-// oldRecordsStillCached returns false (and logs) if any (zone, domain)
-// the old Service claimed to own is missing from the cache. The caller
-// aborts in that case so the next refresh can repopulate before we
-// make any provider changes.
-func (r *Reconciler) oldRecordsStillCached(service, oldService *v1.Service, ownerRef string) bool {
-	oldZoneID, haveOldZone := r.zoneNameToID[oldService.Annotations[AnnotationZone]]
-	if !haveOldZone {
-		return true
-	}
-	for _, d := range parseDomains(oldService.Annotations[AnnotationDomain]) {
-		if _, found := r.CacheRecord(oldZoneID, d, ownerRef); !found {
-			log.Warn().Msgf(
-				"[DNS] [%s] Old record %s missing from cache; skipping update until next refresh",
-				service.Name, d,
-			)
-			metrics.Reconciles.WithLabelValues(metrics.OutcomeSkippedStaleCache).Inc()
-			return false
-		}
-	}
-	return true
+	return nil
 }
 
 // reconcileDomain returns true when the domain is in its desired state
@@ -663,23 +638,21 @@ func hasDrift(existing, desired dnsprovider.Record) bool {
 	return false
 }
 
-func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.Service) {
-	r.reconcile(ctx, service, oldService)
-}
-
-// HandleDeletions removes every cached record owned by the deleted
-// service. Records whose deletion fails are parked in the retry queue
-// and reattempted by the refresh goroutine, since the originating
-// Service is gone and won't produce further events.
-func (r *Reconciler) HandleDeletions(ctx context.Context, service *v1.Service) {
+// Cleanup removes every record owned by service (including in zones
+// the Service no longer references). Individual delete failures enter
+// the internal retry queue; Cleanup itself returns nil even when some
+// deletes fail so callers don't double-retry. The refresh loop's
+// DrainDeleteRetries is the outer retry path for those.
+func (r *Reconciler) Cleanup(ctx context.Context, service *v1.Service) error {
 	owned := r.cacheOwnedBy(service.Namespace, service.Name)
 	if len(owned) == 0 {
 		log.Debug().Msgf("[DNS] [%s] No owned records to delete", service.Name)
-		return
+		return nil
 	}
 	for _, rec := range owned {
 		r.deleteRecordOrRetry(ctx, service.Name, rec)
 	}
+	return nil
 }
 
 // deleteRecordOrRetry removes rec from the provider and the cache. On

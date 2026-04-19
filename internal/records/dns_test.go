@@ -2,6 +2,7 @@ package records_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -35,6 +36,27 @@ func stubRecorder(t *testing.T) *record.FakeRecorder {
 		utils.Recorder = prev //nolint:reassign // restore the production recorder after the test
 	})
 	return recorder
+}
+
+func mustReconcile(t *testing.T, r *records.Reconciler, svc *v1.Service) {
+	t.Helper()
+	if err := r.Reconcile(context.Background(), svc); err != nil {
+		t.Fatalf("Reconcile returned unexpected error: %v", err)
+	}
+}
+
+func mustCleanup(t *testing.T, r *records.Reconciler, svc *v1.Service) {
+	t.Helper()
+	if err := r.Cleanup(context.Background(), svc); err != nil {
+		t.Fatalf("Cleanup returned unexpected error: %v", err)
+	}
+}
+
+func expectIncomplete(t *testing.T, r *records.Reconciler, svc *v1.Service) {
+	t.Helper()
+	if err := r.Reconcile(context.Background(), svc); !errors.Is(err, records.ErrReconcileIncomplete) {
+		t.Fatalf("Reconcile err = %v, want ErrReconcileIncomplete", err)
+	}
 }
 
 func setupTest(t *testing.T) (*records.Reconciler, *fake.Provider, *record.FakeRecorder) {
@@ -74,7 +96,7 @@ func TestHandleAnnotations_CreatesRecord(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	rec, ok := r.CacheRecord(testZoneID, testDomain, "")
 	if !ok {
@@ -92,7 +114,7 @@ func TestHandleAnnotations_SkipsWhenDNSDisabled(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
 	s := svc(map[string]string{records.AnnotationDNS: "false"})
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	if r.CacheLen() != 0 {
 		t.Fatalf("cache should be empty, has %d", r.CacheLen())
@@ -106,7 +128,7 @@ func TestHandleAnnotations_SkipsWhenZoneMissing(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
 	s := svc(dnsAnnotations("unknown.com", testDomain))
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	if r.CacheLen() != 0 {
 		t.Fatalf("cache should be empty, has %d", r.CacheLen())
@@ -127,7 +149,7 @@ func TestHandleAnnotations_DuplicateDomainEmitsEvent(t *testing.T) {
 	})
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
-	r.HandleAnnotations(context.Background(), s)
+	expectIncomplete(t, r, s)
 
 	select {
 	case ev := <-recorder.Events:
@@ -153,7 +175,7 @@ func TestHandleAnnotations_CleansUpStaleOwnedRecord(t *testing.T) {
 	r.SeedCache(stale)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	if _, ok := r.CacheRecord(testZoneID, "old.example.com", ""); ok {
 		t.Fatal("stale record should have been removed from cache")
@@ -183,10 +205,9 @@ func TestHandleUpdates_UpdatesExisting(t *testing.T) {
 	}
 	r.SeedCache(existing)
 
-	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(testZoneName, "new.example.com"))
 
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+	mustReconcile(t, r, newSvc)
 
 	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); ok {
 		t.Fatal("old domain should be removed from cache")
@@ -206,36 +227,15 @@ func TestHandleUpdates_CreatesFreshWhenOldAnnotationsAbsent(t *testing.T) {
 	// should create fresh.
 	r, provider, _ := setupTest(t)
 
-	oldSvc := svc(nil)
 	newSvc := svc(dnsAnnotations(testZoneName, testDomain))
 
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+	mustReconcile(t, r, newSvc)
 
 	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); !ok {
 		t.Fatal("expected fresh record to be created when old annotations are absent")
 	}
 	if len(provider.Snapshot()) != 1 {
 		t.Fatalf("provider should hold the newly-created record, has %d", len(provider.Snapshot()))
-	}
-}
-
-func TestHandleUpdates_SkipsWhenCacheMissDespiteOldAnnotations(t *testing.T) {
-	// Regression: if the old Service had greydns annotations but the
-	// cache lacks the record (e.g. a stale refresh), HandleUpdates
-	// must not create a fresh record; the provider may still hold it
-	// and a fresh create would duplicate.
-	r, provider, _ := setupTest(t)
-
-	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
-	newSvc := svc(dnsAnnotations(testZoneName, testDomain))
-
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
-
-	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); ok {
-		t.Fatal("should not have created a record on cache miss with old annotations present")
-	}
-	if len(provider.Snapshot()) != 0 {
-		t.Fatalf("provider should be untouched, has %d records", len(provider.Snapshot()))
 	}
 }
 
@@ -249,10 +249,9 @@ func TestHandleUpdates_RefusesToUpdateOtherServicesRecord(t *testing.T) {
 		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
 	})
 
-	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(testZoneName, testDomain))
 
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+	expectIncomplete(t, r, newSvc)
 
 	select {
 	case ev := <-recorder.Events:
@@ -284,7 +283,7 @@ func TestHandleDeletions_DeletesOwnedRecord(t *testing.T) {
 	r.SeedCache(existing)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
-	r.HandleDeletions(context.Background(), s)
+	mustCleanup(t, r, s)
 
 	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); ok {
 		t.Fatal("record should be removed from cache")
@@ -305,7 +304,7 @@ func TestHandleDeletions_NoopOnForeignRecord(t *testing.T) {
 	r.SeedCache(existing)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
-	r.HandleDeletions(context.Background(), s)
+	mustCleanup(t, r, s)
 
 	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); !ok {
 		t.Fatal("foreign record should remain in cache")
@@ -334,7 +333,7 @@ func TestHandleDeletions_WorksWhenDNSDisabled(t *testing.T) {
 	r.SeedCache(existing)
 
 	s := svc(map[string]string{records.AnnotationDNS: "false"})
-	r.HandleDeletions(context.Background(), s)
+	mustCleanup(t, r, s)
 
 	if _, ok := r.CacheRecord(testZoneID, testDomain, ""); ok {
 		t.Fatal("record should be removed from cache")
@@ -363,7 +362,7 @@ func TestHandleDeletions_WorksWhenAnnotationsMissing(t *testing.T) {
 	r.SeedCache(existing)
 
 	s := svc(nil)
-	r.HandleDeletions(context.Background(), s)
+	mustCleanup(t, r, s)
 
 	if len(provider.Snapshot()) != 0 {
 		t.Fatal("record should be removed from provider")
@@ -377,7 +376,7 @@ func TestHandleAnnotations_EmptyDomainEmitsEvent(t *testing.T) {
 		records.AnnotationDNS:  "true",
 		records.AnnotationZone: testZoneName,
 	})
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	select {
 	case ev := <-recorder.Events:
@@ -399,7 +398,7 @@ func TestHandleAnnotations_EmptyZoneEmitsEvent(t *testing.T) {
 		records.AnnotationDNS:    "true",
 		records.AnnotationDomain: testDomain,
 	})
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	select {
 	case ev := <-recorder.Events:
@@ -447,10 +446,9 @@ func TestHandleUpdates_RenameOntoOtherOwnerEmitsEvent(t *testing.T) {
 	}
 	r.SeedCache(foreign)
 
-	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(testZoneName, foreignDomain))
 
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+	expectIncomplete(t, r, newSvc)
 
 	select {
 	case ev := <-recorder.Events:
@@ -505,10 +503,9 @@ func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
 	}
 	r.SeedCache(existing)
 
-	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
 	newSvc := svc(dnsAnnotations(otherZoneName, testDomain))
 
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+	mustReconcile(t, r, newSvc)
 
 	snap := provider.Snapshot()
 	if len(snap) != 1 {
@@ -604,7 +601,7 @@ func TestHandleDeletions_RetriesFailedDeletes(t *testing.T) {
 	r.SeedCache(existing)
 	rigged.failDeletesOnce[existing.ID] = true
 
-	r.HandleDeletions(context.Background(), svc(dnsAnnotations(testZoneName, testDomain)))
+	mustCleanup(t, r, svc(dnsAnnotations(testZoneName, testDomain)))
 
 	// First attempt failed: record is still in the provider AND the
 	// cache entry stays (so a subsequent recreate of the same Service
@@ -668,7 +665,7 @@ func TestHandleDeletions_DedupesRepeatedEnqueues(t *testing.T) {
 	svcObj := svc(dnsAnnotations(testZoneName, testDomain))
 	const failedAttempts = 5
 	for range failedAttempts {
-		r.HandleDeletions(context.Background(), svcObj)
+		mustCleanup(t, r, svcObj)
 	}
 
 	// Every HandleDeletions calls the provider once (and fails). That
@@ -759,7 +756,7 @@ func TestHandleAnnotations_ReconcilesDriftedRecord(t *testing.T) {
 	}
 	r.SeedCache(drifted)
 
-	r.HandleAnnotations(context.Background(), svc(dnsAnnotations(testZoneName, testDomain)))
+	mustReconcile(t, r, svc(dnsAnnotations(testZoneName, testDomain)))
 
 	reconciled, ok := r.CacheRecord(testZoneID, testDomain, dnsprovider.OwnerRefFor(testNS, testSvcName))
 	if !ok {
@@ -786,7 +783,7 @@ func TestHandleAnnotations_PerServiceTTLOverride(t *testing.T) {
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	s.Annotations[records.AnnotationTTL] = "900"
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	snap := provider.Snapshot()
 	if len(snap) != 1 {
@@ -802,7 +799,7 @@ func TestHandleAnnotations_PerServiceRecordTypeOverride(t *testing.T) {
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	s.Annotations[records.AnnotationRecordType] = "CNAME"
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	snap := provider.Snapshot()
 	if len(snap) != 1 {
@@ -818,7 +815,7 @@ func TestHandleAnnotations_InvalidTTLAnnotationEmitsEvent(t *testing.T) {
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	s.Annotations[records.AnnotationTTL] = "not-an-int"
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	select {
 	case ev := <-recorder.Events:
@@ -840,7 +837,7 @@ func TestHandleAnnotations_UnsupportedRecordTypeEmitsEvent(t *testing.T) {
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	s.Annotations[records.AnnotationRecordType] = "MX"
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	select {
 	case ev := <-recorder.Events:
@@ -859,7 +856,7 @@ func TestHandleAnnotations_ProviderHintsFlowThrough(t *testing.T) {
 	s.Annotations["greydns.io/fake-proxied"] = "true"
 	s.Annotations["greydns.io/fake-mode"] = "strict"
 	s.Annotations["greydns.io/unrelated"] = "ignored"
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	snap := provider.Snapshot()
 	if len(snap) != 1 {
@@ -952,7 +949,7 @@ func TestHandleAnnotations_TTLOverrideBlockedByPolicy(t *testing.T) {
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	s.Annotations[records.AnnotationTTL] = "900"
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	select {
 	case ev := <-recorder.Events:
@@ -984,7 +981,7 @@ func TestHandleAnnotations_ProviderHintBlockedByPolicy(t *testing.T) {
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	s.Annotations["greydns.io/fake-proxied"] = "true"
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	select {
 	case ev := <-recorder.Events:
@@ -1023,7 +1020,7 @@ func TestHandleAnnotations_TTLOverrideDriftTriggersUpdate(t *testing.T) {
 	// Reconcile with a TTL override that differs from the cached TTL.
 	s := svc(dnsAnnotations(testZoneName, testDomain))
 	s.Annotations[records.AnnotationTTL] = "900"
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	snap := provider.Snapshot()
 	if len(snap) != 1 {
@@ -1038,7 +1035,7 @@ func TestHandleAnnotations_MultipleDomainsCreateAll(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
 	s := svc(dnsAnnotations(testZoneName, "a.example.com, b.example.com,c.example.com"))
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	names := map[string]bool{}
 	for _, rec := range provider.Snapshot() {
@@ -1058,7 +1055,7 @@ func TestHandleAnnotations_DedupesDomainsInAnnotation(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
 	s := svc(dnsAnnotations(testZoneName, "a.example.com,a.example.com, a.example.com"))
-	r.HandleAnnotations(context.Background(), s)
+	mustReconcile(t, r, s)
 
 	if len(provider.Snapshot()) != 1 {
 		t.Fatalf("duplicated domain should produce one record, got %d", len(provider.Snapshot()))
@@ -1069,13 +1066,13 @@ func TestHandleUpdates_AddsNewDomainKeepsExisting(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
 	oldSvc := svc(dnsAnnotations(testZoneName, "a.example.com"))
-	r.HandleAnnotations(context.Background(), oldSvc)
+	mustReconcile(t, r, oldSvc)
 	if len(provider.Snapshot()) != 1 {
 		t.Fatalf("initial create failed, have %d records", len(provider.Snapshot()))
 	}
 
 	newSvc := svc(dnsAnnotations(testZoneName, "a.example.com,b.example.com"))
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+	mustReconcile(t, r, newSvc)
 
 	names := map[string]bool{}
 	for _, rec := range provider.Snapshot() {
@@ -1090,13 +1087,13 @@ func TestHandleUpdates_DroppedDomainGetsCleanedUp(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
 	oldSvc := svc(dnsAnnotations(testZoneName, "a.example.com,b.example.com"))
-	r.HandleAnnotations(context.Background(), oldSvc)
+	mustReconcile(t, r, oldSvc)
 	if len(provider.Snapshot()) != 2 {
 		t.Fatalf("initial create failed, have %d records", len(provider.Snapshot()))
 	}
 
 	newSvc := svc(dnsAnnotations(testZoneName, "a.example.com"))
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+	mustReconcile(t, r, newSvc)
 
 	snap := provider.Snapshot()
 	if len(snap) != 1 || snap[0].Name != "a.example.com" {
@@ -1112,7 +1109,7 @@ func TestHandleUpdates_ContestedNewDomainPreservesOldRecords(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
 	oldSvc := svc(dnsAnnotations(testZoneName, "a.example.com"))
-	r.HandleAnnotations(context.Background(), oldSvc)
+	mustReconcile(t, r, oldSvc)
 
 	// Seed a peer-owned record at the new target name.
 	r.SeedCache(dnsprovider.Record{
@@ -1123,7 +1120,7 @@ func TestHandleUpdates_ContestedNewDomainPreservesOldRecords(t *testing.T) {
 	})
 
 	newSvc := svc(dnsAnnotations(testZoneName, "b.example.com"))
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+	expectIncomplete(t, r, newSvc)
 
 	names := map[string]bool{}
 	for _, rec := range provider.Snapshot() {
@@ -1131,85 +1128,5 @@ func TestHandleUpdates_ContestedNewDomainPreservesOldRecords(t *testing.T) {
 	}
 	if !names["a.example.com"] {
 		t.Fatalf("a.example.com should be preserved when rename target is contested, got %v", names)
-	}
-}
-
-func TestHandleUpdates_RenameWithStaleCacheSkipsToAvoidLeak(t *testing.T) {
-	// Regression: when a Service renames its domain but the cache has
-	// lost the old record, we must abort rather than create the new
-	// record and leak the old one (cleanup can't delete a record it
-	// can't see).
-	r, provider, _ := setupTest(t)
-
-	// Seed the provider with the old record but leave the cache empty,
-	// mimicking a stale cache window between a create and the next
-	// refresh.
-	seeded, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
-		ZoneID:   testZoneID,
-		Name:     "old.example.com",
-		Type:     dnsprovider.RecordTypeA,
-		Content:  testIngress,
-		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
-	})
-	if err != nil {
-		t.Fatalf("seed create: %v", err)
-	}
-
-	oldSvc := svc(dnsAnnotations(testZoneName, "old.example.com"))
-	newSvc := svc(dnsAnnotations(testZoneName, "new.example.com"))
-
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
-
-	// Provider should still hold only the old record: new.example.com
-	// was not created, and old.example.com was not deleted.
-	snap := provider.Snapshot()
-	if len(snap) != 1 {
-		t.Fatalf("provider should hold exactly the seeded record, got %d", len(snap))
-	}
-	if snap[0].ID != seeded.ID || snap[0].Name != "old.example.com" {
-		t.Fatalf("seeded record should be intact, got %+v", snap[0])
-	}
-}
-
-func TestHandleUpdates_ZoneMigrationWithStaleCacheSkipsToAvoidLeak(t *testing.T) {
-	// Same defence for zone migration: if the cache lost the old-zone
-	// record, skip so the next refresh can repopulate before we make
-	// changes.
-	const otherZoneID, otherZoneName = "zone-id-2", "other.example"
-	provider := fake.New(
-		dnsprovider.Zone{ID: testZoneID, Name: testZoneName},
-		dnsprovider.Zone{ID: otherZoneID, Name: otherZoneName},
-	)
-	stubRecorder(t)
-	r := records.NewReconciler(
-		provider,
-		map[string]string{testZoneName: testZoneID, otherZoneName: otherZoneID},
-		testIngress,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("", false),
-	)
-
-	seeded, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
-		ZoneID:   testZoneID,
-		Name:     testDomain,
-		Type:     dnsprovider.RecordTypeA,
-		Content:  testIngress,
-		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
-	})
-	if err != nil {
-		t.Fatalf("seed create: %v", err)
-	}
-
-	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
-	newSvc := svc(dnsAnnotations(otherZoneName, testDomain))
-
-	r.HandleUpdates(context.Background(), newSvc, oldSvc)
-
-	snap := provider.Snapshot()
-	if len(snap) != 1 || snap[0].ID != seeded.ID {
-		t.Fatalf("seeded record should be intact, provider has %+v", snap)
 	}
 }
