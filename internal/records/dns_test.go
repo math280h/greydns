@@ -601,14 +601,64 @@ func TestHandleDeletions_RetriesFailedDeletes(t *testing.T) {
 
 	r.HandleDeletions(context.Background(), svc(dnsAnnotations(testZoneName, testDomain)))
 
-	// First attempt failed, record is still in provider but out of cache.
+	// First attempt failed: record is still in the provider AND the
+	// cache entry stays (so a subsequent recreate of the same Service
+	// doesn't cache-miss and duplicate).
 	if len(base.Snapshot()) != 1 {
 		t.Fatalf("provider should still hold the record after failed delete, has %d", len(base.Snapshot()))
+	}
+	if _, cached := r.CacheRecord(testZoneID, testDomain, ""); !cached {
+		t.Fatal("cache entry should remain until the delete succeeds")
 	}
 
 	r.DrainDeleteRetries(context.Background())
 
 	if len(base.Snapshot()) != 0 {
 		t.Fatalf("retry drain should have removed the record, provider has %d", len(base.Snapshot()))
+	}
+	if _, cached := r.CacheRecord(testZoneID, testDomain, ""); cached {
+		t.Fatal("cache entry should be cleared once the delete retry succeeds")
+	}
+}
+
+func TestHandleAnnotations_ReconcilesDriftedRecord(t *testing.T) {
+	// Regression: if a cached record's content, TTL, or type diverges
+	// from desired state (e.g. ingress-destination changed in config
+	// or the record was edited out-of-band), HandleAnnotations should
+	// update the record on the next reconcile rather than ignoring it.
+	r, provider, _ := setupTest(t)
+
+	drifted, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Type:     dnsprovider.RecordTypeA,
+		Content:  "9.9.9.9", // differs from testIngress
+		TTL:      300,       // differs from Reconciler.recordTTL (60)
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+	r.SeedCache(drifted)
+
+	r.HandleAnnotations(context.Background(), svc(dnsAnnotations(testZoneName, testDomain)))
+
+	reconciled, ok := r.CacheRecord(testZoneID, testDomain, dnsprovider.OwnerRefFor(testNS, testSvcName))
+	if !ok {
+		t.Fatal("reconciled record missing from cache")
+	}
+	if reconciled.Content != testIngress {
+		t.Fatalf("content drift not fixed: got %q, want %q", reconciled.Content, testIngress)
+	}
+	if reconciled.TTL != 60 {
+		t.Fatalf("TTL drift not fixed: got %d, want 60", reconciled.TTL)
+	}
+	// Provider state should also reflect the corrected values.
+	snap := provider.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("provider should hold exactly one record, has %d", len(snap))
+	}
+	if snap[0].Content != testIngress {
+		t.Fatalf("provider content not reconciled: got %q", snap[0].Content)
 	}
 }

@@ -104,6 +104,13 @@ func main() {
 	select {}
 }
 
+// refreshAttemptBudget caps the number of back-to-back refresh attempts
+// per tick. In a busy cluster handler writes can race the snapshot and
+// cause ReplaceCacheIfUnchanged to skip repeatedly; we retry to avoid
+// starving out-of-band updates entirely, but bound the retries so a
+// sustained write storm can't spin the goroutine indefinitely.
+const refreshAttemptBudget = 3
+
 func runRefreshLoop(
 	ctx context.Context,
 	provider dnsprovider.Provider,
@@ -115,20 +122,32 @@ func runRefreshLoop(
 	defer ticker.Stop()
 	for range ticker.C {
 		reconciler.DrainDeleteRetries(ctx)
+		refreshOnce(ctx, provider, zoneNameToID, reconciler)
+	}
+}
 
+func refreshOnce(
+	ctx context.Context,
+	provider dnsprovider.Provider,
+	zoneNameToID map[string]string,
+	reconciler *records.Reconciler,
+) {
+	for attempt := 1; attempt <= refreshAttemptBudget; attempt++ {
 		// Capture the mutation generation before the network round-trip
-		// so any handler writes that land while refresh is in flight
-		// will be detected and keep us from clobbering them.
+		// so any handler write that lands while refresh is in flight is
+		// detected and we avoid clobbering it.
 		gen := reconciler.WriteGen()
 		next, err := refreshCache(ctx, provider, zoneNameToID)
 		if err != nil {
 			log.Error().Err(err).Msg("[Core] Cache refresh failed; keeping previous cache")
-			continue
+			return
 		}
-		if !reconciler.ReplaceCacheIfUnchanged(next, gen) {
-			log.Info().Msg("[Core] Cache mutated during refresh; skipping this cycle")
+		if reconciler.ReplaceCacheIfUnchanged(next, gen) {
+			return
 		}
+		log.Info().Int("attempt", attempt).Msg("[Core] Cache mutated during refresh; retrying")
 	}
+	log.Warn().Int("budget", refreshAttemptBudget).Msg("[Core] Refresh retry budget exhausted; next tick will try again")
 }
 
 // extractServiceFromDelete unwraps a DeleteFunc argument. client-go
