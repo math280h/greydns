@@ -889,8 +889,8 @@ func TestOverridePolicy_Allows(t *testing.T) {
 			raw:    "",
 			hasKey: false,
 			queries: map[string]bool{
-				"ttl":               true,
-				"record-type":       true,
+				"ttl":                true,
+				"record-type":        true,
 				"cloudflare-proxied": true,
 			},
 		},
@@ -899,7 +899,7 @@ func TestOverridePolicy_Allows(t *testing.T) {
 			raw:    "*",
 			hasKey: true,
 			queries: map[string]bool{
-				"ttl":               true,
+				"ttl":                true,
 				"cloudflare-proxied": true,
 			},
 		},
@@ -917,10 +917,10 @@ func TestOverridePolicy_Allows(t *testing.T) {
 			raw:    "ttl, record-type",
 			hasKey: true,
 			queries: map[string]bool{
-				"ttl":               true,
-				"record-type":       true,
+				"ttl":                true,
+				"record-type":        true,
 				"cloudflare-proxied": false,
-				"unknown":           false,
+				"unknown":            false,
 			},
 		},
 	}
