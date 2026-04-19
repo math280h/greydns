@@ -385,6 +385,63 @@ func TestHandleAnnotations_EmptyZoneEmitsEvent(t *testing.T) {
 	}
 }
 
+func TestHandleUpdates_RenameOntoOtherOwnerEmitsEvent(t *testing.T) {
+	// Regression: a Service must not be able to rename onto a domain
+	// already owned by a different Service. The rename aborts with a
+	// DuplicateDomain event and the peer's record is left intact.
+	r, provider, recorder := setupTest(t)
+
+	mine, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
+		ZoneID:   testZoneID,
+		Name:     testDomain,
+		Type:     dnsprovider.RecordTypeA,
+		Content:  testIngress,
+		TTL:      60,
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+	})
+	if err != nil {
+		t.Fatalf("seed mine: %v", err)
+	}
+	r.SeedCache(testZoneID, testDomain, mine)
+
+	const foreignDomain = "foreign.example.com"
+	foreign, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
+		ZoneID:   testZoneID,
+		Name:     foreignDomain,
+		Type:     dnsprovider.RecordTypeA,
+		Content:  testIngress,
+		TTL:      60,
+		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
+	})
+	if err != nil {
+		t.Fatalf("seed foreign: %v", err)
+	}
+	r.SeedCache(testZoneID, foreignDomain, foreign)
+
+	oldSvc := svc(dnsAnnotations(testZoneName, testDomain))
+	newSvc := svc(dnsAnnotations(testZoneName, foreignDomain))
+
+	r.HandleUpdates(context.Background(), newSvc, oldSvc)
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "DuplicateDomain") {
+			t.Fatalf("expected DuplicateDomain event, got %q", ev)
+		}
+	default:
+		t.Fatal("expected DuplicateDomain event, got none")
+	}
+	// Foreign record untouched.
+	stillForeign, ok := r.CacheRecord(testZoneID, foreignDomain)
+	if !ok || stillForeign.OwnerRef != dnsprovider.OwnerRefFor(testNS, "other") {
+		t.Fatal("foreign record should still be owned by the other service")
+	}
+	// Original record still in place (rename aborted).
+	if _, intact := r.CacheRecord(testZoneID, testDomain); !intact {
+		t.Fatal("original record should be intact after rename abort")
+	}
+}
+
 func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
 	// Regression: a Service that changes greydns.io/zone must have its
 	// record moved from the old zone to the new zone, not updated

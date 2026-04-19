@@ -261,6 +261,20 @@ func (r *Reconciler) HandleUpdates(ctx context.Context, service, oldService *v1.
 		return
 	}
 
+	// Rename or migration: the destination differs from the current
+	// cache entry. If some other Service already owns (zoneID,
+	// newDomain), abort so a Service can't take over a peer's domain
+	// by mutating its annotations. In-place updates (same zone, same
+	// name) skip this check because they modify the record we already
+	// own.
+	movingKey := existing.ZoneID != zoneID || oldDomain != newDomain
+	if movingKey {
+		if dest, destExists := r.cacheGet(CacheKey{ZoneID: zoneID, Name: newDomain}); destExists && !ownedBy(dest, service) {
+			emitDuplicateDomain(service)
+			return
+		}
+	}
+
 	// Zone change: the existing record lives in existing.ZoneID, which
 	// may differ from the zoneID resolved from the new annotation.
 	// Record IDs are zone-scoped, so an in-place update would target

@@ -123,6 +123,27 @@ func runRefreshLoop(
 	}
 }
 
+// extractServiceFromDelete unwraps a DeleteFunc argument. client-go
+// delivers either a *v1.Service or a cache.DeletedFinalStateUnknown
+// tombstone when the informer missed the delete event; both must be
+// cleaned up or owned DNS records leak.
+func extractServiceFromDelete(obj interface{}) *v1.Service {
+	if svc, ok := obj.(*v1.Service); ok {
+		return svc
+	}
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		log.Error().Msg("[Core] Failed to cast object during delete")
+		return nil
+	}
+	svc, ok := tombstone.Obj.(*v1.Service)
+	if !ok {
+		log.Error().Msg("[Core] Tombstone during delete did not contain a Service")
+		return nil
+	}
+	return svc
+}
+
 func serviceEventHandlers(ctx context.Context, reconciler *records.Reconciler) cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -151,9 +172,8 @@ func serviceEventHandlers(ctx context.Context, reconciler *records.Reconciler) c
 			reconciler.HandleUpdates(ctx, service, oldService)
 		},
 		DeleteFunc: func(obj interface{}) {
-			service, ok := obj.(*v1.Service)
-			if !ok {
-				log.Error().Msg("[Core] Failed to cast object during delete")
+			service := extractServiceFromDelete(obj)
+			if service == nil {
 				return
 			}
 			reconciler.HandleDeletions(ctx, service)

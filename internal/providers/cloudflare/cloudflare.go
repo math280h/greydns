@@ -193,9 +193,20 @@ func (p *Provider) fromResponse(zoneID string, resp *dns.RecordResponse) dnsprov
 	}
 }
 
+// parseOwner extracts the greydns owner ref from a Cloudflare record
+// comment. Returns ok=false unless the comment starts with the greydns
+// marker and the suffix is a well-formed "<namespace>/<name>" pair with
+// both parts non-empty; otherwise a degenerate record (e.g. a stray
+// "[greydns]owner=") would land in the cache without matching any
+// Service and could never be cleaned up.
 func parseOwner(comment string) (string, bool) {
 	if !strings.HasPrefix(comment, commentMarker) {
 		return "", false
 	}
-	return strings.TrimPrefix(comment, commentMarker), true
+	owner := strings.TrimPrefix(comment, commentMarker)
+	namespace, name, ok := strings.Cut(owner, "/")
+	if !ok || namespace == "" || name == "" || strings.Contains(name, "/") {
+		return "", false
+	}
+	return owner, true
 }
