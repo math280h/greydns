@@ -252,7 +252,7 @@ func (r *Reconciler) DrainDeleteRetries(ctx context.Context) {
 	pending := r.deleteRetries
 	r.deleteRetries = nil
 	r.mu.Unlock()
-	metrics.RetryQueueDepth.Set(float64(len(r.deleteRetries)))
+	metrics.RetryQueueDepth.Set(0)
 	if len(pending) == 0 {
 		return
 	}
@@ -700,8 +700,8 @@ func (r *Reconciler) deleteRecordOrRetry(ctx context.Context, serviceName string
 }
 
 // callProviderCreate / callProviderUpdate / callProviderDelete wrap
-// provider calls with timing + outcome metrics. Every provider
-// interaction flows through one of these.
+// the reconciler's provider calls with timing + outcome metrics. The
+// refresh loop in cmd/main wraps its own list-path calls separately.
 func (r *Reconciler) callProviderCreate(ctx context.Context, rec dnsprovider.Record) (dnsprovider.Record, error) {
 	var err error
 	defer metrics.ObserveProviderCall(r.provider.Name(), metrics.OpCreate)(&err)

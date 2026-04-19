@@ -28,11 +28,11 @@ const (
 
 // Operation values for the provider_calls counters.
 const (
-	OpListZones  = "list_zones"
-	OpListOwned  = "list_owned"
-	OpCreate     = "create"
-	OpUpdate     = "update"
-	OpDelete     = "delete"
+	OpListZones = "list_zones"
+	OpListOwned = "list_owned"
+	OpCreate    = "create"
+	OpUpdate    = "update"
+	OpDelete    = "delete"
 )
 
 //nolint:gochecknoglobals // Prometheus collectors are idiomatic package globals
