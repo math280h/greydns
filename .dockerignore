@@ -1,0 +1,11 @@
+.git
+.github
+.claude
+docs
+assets
+deployment.yaml
+Dockerfile
+README.md
+LICENSE
+*.exe
+cmd.exe

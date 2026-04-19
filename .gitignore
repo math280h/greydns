@@ -1,3 +1,7 @@
 tmp
 test-deployment.yaml
 cmd.exe
+.claude/
+.env
+.env.*
+!.env.example
