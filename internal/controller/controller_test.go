@@ -7,6 +7,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kfake "k8s.io/client-go/kubernetes/fake"
 	krecord "k8s.io/client-go/tools/record"
@@ -128,8 +129,9 @@ func TestController_AddCreatesRecord(t *testing.T) {
 	if rec.Name != itDomain {
 		t.Fatalf("record name = %q, want %q", rec.Name, itDomain)
 	}
-	if rec.OwnerRef != dnsprovider.OwnerRefFor(itNamespace, itSvcName) {
-		t.Fatalf("owner ref = %q, want %q", rec.OwnerRef, dnsprovider.OwnerRefFor(itNamespace, itSvcName))
+	want := dnsprovider.OwnerRefFor(dnsprovider.KindService, itNamespace, itSvcName)
+	if rec.OwnerRef != want {
+		t.Fatalf("owner ref = %q, want %q", rec.OwnerRef, want)
 	}
 }
 
@@ -383,5 +385,137 @@ func TestController_WorkqueueRetriesOnProviderError(t *testing.T) {
 
 	eventually(t, "record eventually created after retry", func() bool {
 		return len(base.Snapshot()) == 1
+	})
+}
+
+func newIngress(name string, annotations map[string]string, hosts ...string) *networkingv1.Ingress {
+	rules := make([]networkingv1.IngressRule, 0, len(hosts))
+	for _, h := range hosts {
+		rules = append(rules, networkingv1.IngressRule{Host: h})
+	}
+	return &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   itNamespace,
+			Name:        name,
+			Annotations: annotations,
+		},
+		Spec: networkingv1.IngressSpec{Rules: rules},
+	}
+}
+
+func ingressDNSOn() map[string]string {
+	return map[string]string{
+		records.AnnotationDNS:  "true",
+		records.AnnotationZone: itZoneName,
+	}
+}
+
+func TestController_IngressAddCreatesRecord(t *testing.T) {
+	rig := newRig(t)
+	ctx := context.Background()
+
+	ing := newIngress("web", ingressDNSOn(), itDomain, "alt.example.com")
+	if _, err := rig.clientset.NetworkingV1().Ingresses(itNamespace).Create(
+		ctx, ing, metav1.CreateOptions{},
+	); err != nil {
+		t.Fatalf("create ingress: %v", err)
+	}
+
+	eventually(t, "ingress records created", func() bool {
+		return len(rig.provider.Snapshot()) == 2
+	})
+	want := dnsprovider.OwnerRefFor(dnsprovider.KindIngress, itNamespace, "web")
+	for _, rec := range rig.provider.Snapshot() {
+		if rec.OwnerRef != want {
+			t.Fatalf("owner ref = %q, want %q", rec.OwnerRef, want)
+		}
+	}
+}
+
+func TestController_IngressDeleteRemovesRecords(t *testing.T) {
+	rig := newRig(t)
+	ctx := context.Background()
+
+	if _, err := rig.clientset.NetworkingV1().Ingresses(itNamespace).Create(
+		ctx, newIngress("web", ingressDNSOn(), itDomain), metav1.CreateOptions{},
+	); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	eventually(t, "record created", func() bool {
+		return len(rig.provider.Snapshot()) == 1
+	})
+
+	if err := rig.clientset.NetworkingV1().Ingresses(itNamespace).Delete(
+		ctx, "web", metav1.DeleteOptions{},
+	); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	eventually(t, "record removed", func() bool {
+		return len(rig.provider.Snapshot()) == 0
+	})
+}
+
+func TestController_IngressAndServiceSameNameCoexist(t *testing.T) {
+	// Regression: an Ingress and Service sharing namespace/name must
+	// not steal each other's records. Deleting the Service leaves the
+	// Ingress's record in place.
+	rig := newRig(t)
+	ctx := context.Background()
+
+	if _, err := rig.clientset.CoreV1().Services(itNamespace).Create(
+		ctx, newService("shared", map[string]string{
+			records.AnnotationDNS:    "true",
+			records.AnnotationZone:   itZoneName,
+			records.AnnotationDomain: "svc.example.com",
+		}), metav1.CreateOptions{},
+	); err != nil {
+		t.Fatalf("create service: %v", err)
+	}
+	if _, err := rig.clientset.NetworkingV1().Ingresses(itNamespace).Create(
+		ctx, newIngress("shared", ingressDNSOn(), "ing.example.com"), metav1.CreateOptions{},
+	); err != nil {
+		t.Fatalf("create ingress: %v", err)
+	}
+
+	eventually(t, "both records created", func() bool {
+		return len(rig.provider.Snapshot()) == 2
+	})
+
+	if err := rig.clientset.CoreV1().Services(itNamespace).Delete(
+		ctx, "shared", metav1.DeleteOptions{},
+	); err != nil {
+		t.Fatalf("delete service: %v", err)
+	}
+
+	eventually(t, "only ingress record remains", func() bool {
+		snap := rig.provider.Snapshot()
+		return len(snap) == 1 && snap[0].Name == "ing.example.com"
+	})
+}
+
+func TestController_IngressUpdateRuleTriggersReconcile(t *testing.T) {
+	rig := newRig(t)
+	ctx := context.Background()
+
+	ing, err := rig.clientset.NetworkingV1().Ingresses(itNamespace).Create(
+		ctx, newIngress("web", ingressDNSOn(), itDomain), metav1.CreateOptions{},
+	)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	eventually(t, "initial record", func() bool {
+		return len(rig.provider.Snapshot()) == 1
+	})
+
+	ing.Spec.Rules = append(ing.Spec.Rules, networkingv1.IngressRule{Host: "extra.example.com"})
+	if _, updateErr := rig.clientset.NetworkingV1().Ingresses(itNamespace).Update(
+		ctx, ing, metav1.UpdateOptions{},
+	); updateErr != nil {
+		t.Fatalf("update: %v", updateErr)
+	}
+
+	eventually(t, "new host reconciled", func() bool {
+		return len(rig.provider.Snapshot()) == 2
 	})
 }

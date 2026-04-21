@@ -11,7 +11,7 @@ GreyDNS enables development teams to manage their DNS records directly through K
 
 ```mermaid
 flowchart LR
-    dev([Developer]) -->|kubectl apply| svc["Service<br/>greydns.io/* annotations"]
+    dev([Developer]) -->|kubectl apply| svc["Service or Ingress<br/>greydns.io/* annotations"]
     subgraph k8s[Kubernetes cluster]
         svc -->|informer event| ctrl[greydns controller]
         cm[(ConfigMap<br/>greydns-config)] --> ctrl
@@ -23,7 +23,8 @@ flowchart LR
 
 ## 🚀 Features
 
-- **Annotation-Driven**: Create and manage DNS records using simple Kubernetes service annotations
+- **Annotation-Driven**: Create and manage DNS records using simple Kubernetes Service or Ingress annotations
+- **Ingress-Aware**: Automatically creates one record per `spec.rules[].host` on annotated Ingresses
 - **Central Ingress**: Works with centrally managed ingress controllers
 - **Real-time Updates**: Automatically syncs DNS records when annotations change
 - **Lightweight**: Minimal resource footprint with efficient caching
@@ -121,6 +122,29 @@ spec:
 | `greydns.io/<provider>-<key>` | No | Provider-scoped override, e.g. `greydns.io/cloudflare-proxied`. |
 
 Invalid override values fall back to the controller default and surface as an `InvalidAnnotation` event on the Service. Per-Service overrides can be restricted cluster-wide via the `allowed-overrides` ConfigMap key; overrides not on the allowlist are ignored with the same event.
+
+### Ingress support
+
+greydns watches `networking.k8s.io/v1/Ingress` objects alongside Services. Adding the same `greydns.io/*` annotations to an Ingress makes greydns create one record per unique `spec.rules[].host` entry.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  annotations:
+    greydns.io/dns: "true"
+    greydns.io/zone: "example.com"
+    # Optional per-resource overrides:
+    greydns.io/ttl: "300"
+    greydns.io/cloudflare-proxied: "true"
+spec:
+  rules:
+    - host: app.example.com
+    - host: api.example.com
+```
+
+`greydns.io/domain` is ignored on Ingresses; the host list comes from `spec.rules`. An Ingress and a Service sharing namespace/name own disjoint records (the owner reference includes the Kubernetes kind), and greydns emits `DuplicateDomain` when an Ingress host is already owned by another resource.
 
 ### Duplicate Records
 
