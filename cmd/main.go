@@ -123,9 +123,12 @@ func run() error {
 // time mutates DNS.
 func runAsLeader(leaderCtx context.Context, clientset kubernetes.Interface, secretData map[string][]byte) error {
 	provider := mustBuildProvider(secretData)
-	ttl := mustAtoi(cfg.GetRequiredConfigValue("record-ttl"), "record-ttl")
 	refreshInterval := mustRefreshInterval()
-	recordType := mustRecordType(provider)
+
+	initialSnapshot, err := records.ParseSnapshot(cfg.Data(), provider)
+	if err != nil {
+		return fmt.Errorf("parse initial config: %w", err)
+	}
 
 	zoneNameToID := mustListZones(leaderCtx, provider)
 	initialCache, refreshErr := refreshCache(leaderCtx, provider, zoneNameToID)
@@ -133,15 +136,7 @@ func runAsLeader(leaderCtx context.Context, clientset kubernetes.Interface, secr
 		return fmt.Errorf("initial cache refresh: %w", refreshErr)
 	}
 
-	overrideRaw, hasOverrideKey := cfg.Data()["allowed-overrides"]
-	reconciler := records.NewReconciler(
-		provider,
-		zoneNameToID,
-		cfg.GetRequiredConfigValue("ingress-destination"),
-		ttl,
-		recordType,
-		records.NewOverridePolicy(overrideRaw, hasOverrideKey),
-	)
+	reconciler := records.NewReconciler(provider, zoneNameToID, initialSnapshot)
 	reconciler.ReplaceCache(initialCache)
 
 	ctrl := controller.New(clientset, reconciler)
@@ -150,16 +145,56 @@ func runAsLeader(leaderCtx context.Context, clientset kubernetes.Interface, secr
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		runRefreshLoop(leaderCtx, provider, zoneNameToID, reconciler, refreshInterval)
+	}()
+	go func() {
+		defer wg.Done()
+		runConfigWatcher(leaderCtx, clientset, provider, reconciler, ctrl.ResyncAll)
 	}()
 
 	<-leaderCtx.Done()
 	wg.Wait()
 	ctrl.Wait()
 	return nil
+}
+
+// runConfigWatcher re-parses greydns-config on every change and swaps
+// the reconciler's snapshot. Invalid data (bad TTL, unsupported record
+// type) is logged and ignored; the reconciler keeps its previous
+// snapshot so a typo in the ConfigMap can't break running reconciles.
+func runConfigWatcher(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	provider dnsprovider.Provider,
+	reconciler *records.Reconciler,
+	resync func() error,
+) {
+	initialApplied := false
+	err := cfg.Watch(ctx, clientset, namespaceFromEnv(), "greydns-config", func(data map[string]string) {
+		next, parseErr := records.ParseSnapshot(data, provider)
+		if parseErr != nil {
+			log.Error().Err(parseErr).Msg("[Config] Rejecting invalid ConfigMap update; keeping previous snapshot")
+			return
+		}
+		reconciler.UpdateSnapshot(next)
+		log.Info().Msg("[Config] Snapshot updated from ConfigMap")
+		// Skip the resync on the initial load: the reconciler was just
+		// built with the same snapshot and the informer will emit an
+		// Add for every Service/Ingress anyway.
+		if !initialApplied {
+			initialApplied = true
+			return
+		}
+		if resyncErr := resync(); resyncErr != nil {
+			log.Error().Err(resyncErr).Msg("[Config] Resync after snapshot swap failed")
+		}
+	})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		log.Error().Err(err).Msg("[Config] ConfigMap watcher exited with error")
+	}
 }
 
 // namespaceFromEnv honours the POD_NAMESPACE downward-API env var so
@@ -194,14 +229,6 @@ func mustRefreshInterval() time.Duration {
 			Msg("[Core] cache-refresh-seconds must be greater than 0")
 	}
 	return time.Duration(seconds) * time.Second
-}
-
-func mustRecordType(provider dnsprovider.Provider) dnsprovider.RecordType {
-	rt := dnsprovider.RecordType(cfg.GetRequiredConfigValue("record-type"))
-	if err := dnsprovider.ValidateRecordType(rt, provider.SupportedRecordTypes()); err != nil {
-		log.Fatal().Err(err).Str("provider", provider.Name()).Msg("[Core] record-type rejected by provider")
-	}
-	return rt
 }
 
 // refreshAttemptBudget bounds per-tick retries when handler writes

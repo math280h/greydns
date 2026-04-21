@@ -15,6 +15,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	listersv1 "k8s.io/client-go/listers/core/v1"
@@ -107,6 +108,35 @@ func (c *Controller) Start(ctx context.Context) error {
 // caller needs to tear down shared state workers still touch.
 func (c *Controller) Wait() {
 	c.workersWG.Wait()
+}
+
+// ResyncAll enqueues every Service and Ingress currently in the
+// informer caches. Used by the config watcher so a ConfigMap change
+// propagates to existing records immediately rather than waiting for
+// the next per-resource event or the informer resync period.
+func (c *Controller) ResyncAll() error {
+	if c.serviceLister == nil || c.ingressLister == nil {
+		return errors.New("controller: ResyncAll before Start")
+	}
+	services, err := c.serviceLister.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("controller: list services for resync: %w", err)
+	}
+	for _, svc := range services {
+		c.enqueueKey(dnsprovider.KindService, svc.Namespace, svc.Name)
+	}
+	ingresses, err := c.ingressLister.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("controller: list ingresses for resync: %w", err)
+	}
+	for _, ing := range ingresses {
+		c.enqueueKey(dnsprovider.KindIngress, ing.Namespace, ing.Name)
+	}
+	log.Info().
+		Int("services", len(services)).
+		Int("ingresses", len(ingresses)).
+		Msg("[Core] Resyncing all watched resources")
+	return nil
 }
 
 func (c *Controller) Ready() bool {

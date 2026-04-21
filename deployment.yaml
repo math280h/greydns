@@ -109,7 +109,10 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["greydns-config"]
-    verbs: ["get"]
+    # list/watch are authorized by resourceNames only when the request
+    # includes a matching metadata.name field selector (our informer
+    # does). This keeps the permission pinned to the single object.
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["secrets"]
     resourceNames: ["greydns-secret"]

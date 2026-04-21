@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/rs/zerolog/log"
 	v1 "k8s.io/api/core/v1"
@@ -131,12 +132,9 @@ func (p OverridePolicy) Allows(suffix string) bool {
 }
 
 type Reconciler struct {
-	provider           dnsprovider.Provider
-	zoneNameToID       map[string]string
-	ingressDestination string
-	recordTTL          int
-	recordType         dnsprovider.RecordType
-	overridePolicy     OverridePolicy
+	provider     dnsprovider.Provider
+	zoneNameToID map[string]string
+	snapshot     atomic.Pointer[Snapshot]
 
 	mu            sync.Mutex
 	cache         map[CacheKey]dnsprovider.Record
@@ -146,26 +144,36 @@ type Reconciler struct {
 	deleteRetries []pendingDelete
 }
 
-// NewReconciler returns a Reconciler with its cache initialised.
+// NewReconciler returns a Reconciler with its cache initialised and
+// initial snapshot loaded. Callers can later swap the snapshot via
+// UpdateSnapshot for hot-reload without rebuilding the Reconciler.
 func NewReconciler(
 	provider dnsprovider.Provider,
 	zoneNameToID map[string]string,
-	ingressDestination string,
-	recordTTL int,
-	recordType dnsprovider.RecordType,
-	overridePolicy OverridePolicy,
+	initial Snapshot,
 ) *Reconciler {
-	return &Reconciler{
-		provider:           provider,
-		zoneNameToID:       zoneNameToID,
-		ingressDestination: ingressDestination,
-		recordTTL:          recordTTL,
-		recordType:         recordType,
-		overridePolicy:     overridePolicy,
-		cache:              make(map[CacheKey]dnsprovider.Record),
-		byName:             make(map[nameKey][]CacheKey),
-		byOwner:            make(map[string][]CacheKey),
+	r := &Reconciler{
+		provider:     provider,
+		zoneNameToID: zoneNameToID,
+		cache:        make(map[CacheKey]dnsprovider.Record),
+		byName:       make(map[nameKey][]CacheKey),
+		byOwner:      make(map[string][]CacheKey),
 	}
+	r.snapshot.Store(&initial)
+	return r
+}
+
+// UpdateSnapshot atomically swaps the live configuration. Next
+// reconcile picks up the new values; in-flight reconciles finish with
+// the snapshot they started with.
+func (r *Reconciler) UpdateSnapshot(next Snapshot) {
+	r.snapshot.Store(&next)
+}
+
+// Snapshot returns the current live configuration. Exposed for tests
+// and metrics that need to observe what values reconciles are using.
+func (r *Reconciler) Snapshot() Snapshot {
+	return *r.snapshot.Load()
 }
 
 // ReplaceCache atomically swaps the cache contents and rebuilds
@@ -632,47 +640,48 @@ func (r *Reconciler) cleanupOwnedOutsideDesired(
 }
 
 func (r *Reconciler) desiredRecord(t target, zoneID, domain string) dnsprovider.Record {
+	snap := r.snapshot.Load()
 	return dnsprovider.Record{
 		ZoneID:        zoneID,
 		Name:          domain,
-		Type:          r.resolveRecordType(t),
-		Content:       r.ingressDestination,
-		TTL:           r.resolveTTL(t),
+		Type:          r.resolveRecordType(t, snap),
+		Content:       snap.IngressDestination,
+		TTL:           r.resolveTTL(t, snap),
 		OwnerRef:      t.ownerRef(),
-		ProviderHints: r.collectProviderHints(t),
+		ProviderHints: r.collectProviderHints(t, snap),
 	}
 }
 
-func (r *Reconciler) resolveTTL(t target) int {
+func (r *Reconciler) resolveTTL(t target, snap *Snapshot) int {
 	raw := strings.TrimSpace(t.annotations[AnnotationTTL])
 	if raw == "" {
-		return r.recordTTL
+		return snap.RecordTTL
 	}
-	if !r.overridePolicy.Allows("ttl") {
+	if !snap.OverridePolicy.Allows("ttl") {
 		emitInvalidAnnotation(t, AnnotationTTL+": override not in allowed-overrides")
-		return r.recordTTL
+		return snap.RecordTTL
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil || v <= 0 {
 		emitInvalidAnnotation(t, AnnotationTTL+": must be a positive integer, got "+raw)
-		return r.recordTTL
+		return snap.RecordTTL
 	}
 	return v
 }
 
-func (r *Reconciler) resolveRecordType(t target) dnsprovider.RecordType {
+func (r *Reconciler) resolveRecordType(t target, snap *Snapshot) dnsprovider.RecordType {
 	raw := strings.TrimSpace(t.annotations[AnnotationRecordType])
 	if raw == "" {
-		return r.recordType
+		return snap.RecordType
 	}
-	if !r.overridePolicy.Allows("record-type") {
+	if !snap.OverridePolicy.Allows("record-type") {
 		emitInvalidAnnotation(t, AnnotationRecordType+": override not in allowed-overrides")
-		return r.recordType
+		return snap.RecordType
 	}
 	candidate := dnsprovider.RecordType(raw)
 	if err := dnsprovider.ValidateRecordType(candidate, r.provider.SupportedRecordTypes()); err != nil {
 		emitInvalidAnnotation(t, AnnotationRecordType+": "+err.Error())
-		return r.recordType
+		return snap.RecordType
 	}
 	return candidate
 }
@@ -680,7 +689,7 @@ func (r *Reconciler) resolveRecordType(t target) dnsprovider.RecordType {
 // collectProviderHints reads "greydns.io/<provider>-<key>" annotations
 // into a <key>-keyed map so the active provider sees a clean namespace.
 // Each full "<provider>-<key>" must be allowlisted.
-func (r *Reconciler) collectProviderHints(t target) map[string]string {
+func (r *Reconciler) collectProviderHints(t target, snap *Snapshot) map[string]string {
 	prefix := AnnotationPrefix + r.provider.Name() + "-"
 	hints := make(map[string]string)
 	for k, v := range t.annotations {
@@ -689,7 +698,7 @@ func (r *Reconciler) collectProviderHints(t target) map[string]string {
 			continue
 		}
 		policyKey := r.provider.Name() + "-" + suffix
-		if !r.overridePolicy.Allows(policyKey) {
+		if !snap.OverridePolicy.Allows(policyKey) {
 			emitInvalidAnnotation(t, k+": override not in allowed-overrides")
 			continue
 		}
