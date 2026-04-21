@@ -6,8 +6,9 @@ GreyDNS enables development teams to manage their DNS records directly through K
 
 **Disclaimer:** _GreyDNS is not meant to replace ExternalDNS for a lot of use cases. It's designed to be a solution to a specific problem that Platform Engineers may run into when trying to empower development teams to manage their own DNS records while maintaining a central point of control for ingress._
 
-![Go Version](https://img.shields.io/badge/go-1.24-blue.svg)
+![Go Version](https://img.shields.io/badge/go-1.26-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
+[![Coverage](https://codecov.io/gh/math280h/greydns/graph/badge.svg)](https://codecov.io/gh/math280h/greydns)
 
 ```mermaid
 flowchart LR
@@ -197,6 +198,10 @@ Prometheus metrics are served on `GET /metrics` on the same port (`8080`) as the
 | `greydns_workqueue_depth` | gauge | - | Items currently waiting in the reconcile workqueue. |
 | `greydns_workqueue_adds_total` | counter | - | Items added to the workqueue since startup. |
 | `greydns_workqueue_retries_total` | counter | - | Reconciles that failed and were requeued with backoff. |
+
+## 🆘 Troubleshooting
+
+Common failure modes (RBAC errors, `DuplicateDomain`, zone not managed, stuck deletes, leader lease contention) are catalogued in [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
 ## 🤔 Why Not ExternalDNS?
 
