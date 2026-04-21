@@ -25,11 +25,14 @@ import (
 	"github.com/math280h/greydns/internal/dnsprovider"
 	"github.com/math280h/greydns/internal/dnsprovider/registry"
 	"github.com/math280h/greydns/internal/health"
+	"github.com/math280h/greydns/internal/leader"
 	"github.com/math280h/greydns/internal/metrics"
 	_ "github.com/math280h/greydns/internal/providers" // registers all DNS provider factories
 	"github.com/math280h/greydns/internal/records"
 	"github.com/math280h/greydns/internal/utils"
 )
+
+const defaultNamespace = "default"
 
 func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}) //nolint:reassign // Required for logging
@@ -77,13 +80,54 @@ func run() error {
 
 	utils.StartBroadcaster(clientset)
 
-	provider := mustBuildProvider(secret.Data)
+	// Health probes flip to ready as soon as startup (provider build,
+	// zone discovery, initial cache warm) succeeds, regardless of
+	// leadership. Followers stay probe-green so they can take over fast.
+	ready.Store(true)
+	log.Info().Msg("[Core] greydns is ready")
+
+	identity, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("resolve pod identity: %w", err)
+	}
+	leaseNamespace := namespaceFromEnv()
+
+	leaderErr := leader.Run(ctx, leader.Config{
+		Clientset: clientset,
+		Namespace: leaseNamespace,
+		LeaseName: leader.DefaultLeaseName,
+		Identity:  identity,
+		OnBecome: func(leaderCtx context.Context) {
+			if runErr := runAsLeader(leaderCtx, clientset, secret.Data); runErr != nil {
+				log.Error().Err(runErr).Msg("[Core] Leader run exited with error")
+			}
+		},
+	})
+	if leaderErr != nil {
+		return fmt.Errorf("leader election: %w", leaderErr)
+	}
+
+	log.Info().Msg("[Core] Shutdown signal received; draining")
+	ready.Store(false)
+	if healthErr := <-healthDone; healthErr != nil && !errors.Is(healthErr, context.Canceled) {
+		log.Error().Err(healthErr).Msg("[Health] Server exited with error")
+	}
+	log.Info().Msg("[Core] Shutdown complete")
+	return nil
+}
+
+// runAsLeader builds the provider-backed reconciler and runs the
+// controller plus refresh loop until leaderCtx cancels (leadership lost
+// or shutdown). Called from leader.Run's OnBecome so only one pod at a
+// time mutates DNS.
+func runAsLeader(leaderCtx context.Context, clientset kubernetes.Interface, secretData map[string][]byte) error {
+	provider := mustBuildProvider(secretData)
 	ttl := mustAtoi(cfg.GetRequiredConfigValue("record-ttl"), "record-ttl")
 	refreshInterval := mustRefreshInterval()
 	recordType := mustRecordType(provider)
 
-	zoneNameToID := mustListZones(ctx, provider)
-	initialCache, refreshErr := refreshCache(ctx, provider, zoneNameToID)
+	zoneNameToID := mustListZones(leaderCtx, provider)
+	initialCache, refreshErr := refreshCache(leaderCtx, provider, zoneNameToID)
 	if refreshErr != nil {
 		return fmt.Errorf("initial cache refresh: %w", refreshErr)
 	}
@@ -100,7 +144,7 @@ func run() error {
 	reconciler.ReplaceCache(initialCache)
 
 	ctrl := controller.New(clientset, reconciler)
-	if startErr := ctrl.Start(ctx); startErr != nil {
+	if startErr := ctrl.Start(leaderCtx); startErr != nil {
 		return fmt.Errorf("start controller: %w", startErr)
 	}
 
@@ -108,22 +152,23 @@ func run() error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runRefreshLoop(ctx, provider, zoneNameToID, reconciler, refreshInterval)
+		runRefreshLoop(leaderCtx, provider, zoneNameToID, reconciler, refreshInterval)
 	}()
 
-	ready.Store(true)
-	log.Info().Msg("[Core] greydns is ready")
-
-	<-ctx.Done()
-	log.Info().Msg("[Core] Shutdown signal received; draining")
-
-	ready.Store(false)
+	<-leaderCtx.Done()
 	wg.Wait()
-	if healthErr := <-healthDone; healthErr != nil && !errors.Is(healthErr, context.Canceled) {
-		log.Error().Err(healthErr).Msg("[Health] Server exited with error")
-	}
-	log.Info().Msg("[Core] Shutdown complete")
+	ctrl.Wait()
 	return nil
+}
+
+// namespaceFromEnv honours the POD_NAMESPACE downward-API env var so
+// the lease is created in the pod's own namespace; falls back to
+// "default" to match the existing ConfigMap/Secret lookup path.
+func namespaceFromEnv() string {
+	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return defaultNamespace
 }
 
 func mustBuildProvider(secretData map[string][]byte) dnsprovider.Provider {

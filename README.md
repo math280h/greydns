@@ -146,6 +146,10 @@ spec:
 
 `greydns.io/domain` is ignored on Ingresses; the host list comes from `spec.rules`. An Ingress and a Service sharing namespace/name own disjoint records (the owner reference includes the Kubernetes kind), and greydns emits `DuplicateDomain` when an Ingress host is already owned by another resource.
 
+### Leader election
+
+Every greydns pod participates in a `coordination.k8s.io/Lease` named `greydns-leader` in the pod's namespace; only the lease holder runs the reconciler and refresh loop, so `replicas > 1` is safe. Followers stay alive on the same `/healthz` and `/readyz` probes and take over within `LeaseDuration` (15s) if the leader disappears. The lease is released cleanly on graceful shutdown so rolling updates hand off in under a second.
+
 ### Duplicate Records
 
 GreyDNS will automatically deduplicate records based on the namespace and service name. If you create two records at the same time it's first come first serve.
