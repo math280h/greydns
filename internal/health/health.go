@@ -53,7 +53,8 @@ func (s *Server) Mux() *http.ServeMux { return s.mux }
 // cancellation both probes flip to 503 so kubelet stops routing traffic
 // while in-flight requests drain.
 func (s *Server) Run(ctx context.Context) error {
-	lis, err := net.Listen("tcp", s.srv.Addr)
+	var lc net.ListenConfig
+	lis, err := lc.Listen(ctx, "tcp", s.srv.Addr)
 	if err != nil {
 		return err
 	}
