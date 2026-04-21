@@ -53,6 +53,7 @@ jobs:
         with:
           go-version-input: '1.26'
           go-package: ./...
+          repo-checkout: false
 
   grype:
     runs-on: ubuntu-latest
@@ -75,7 +76,7 @@ jobs:
 
       - name: 🔎 Grype scan
         id: scan
-        uses: anchore/scan-action@v4
+        uses: anchore/scan-action@v7
         with:
           image: greydns:scan
           fail-build: true
