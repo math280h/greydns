@@ -18,6 +18,16 @@ const (
 	RecordTypeCNAME RecordType = "CNAME"
 )
 
+// Kind identifies the Kubernetes resource kind a record is owned by.
+// It's persisted inside OwnerRef so the same namespace/name across kinds
+// can't collide on record ownership.
+type Kind string
+
+const (
+	KindService Kind = "svc"
+	KindIngress Kind = "ing"
+)
+
 var (
 	ErrNotImplemented        = errors.New("not implemented")
 	ErrZoneNotFound          = errors.New("zone not found")
@@ -48,8 +58,10 @@ type Record struct {
 	ProviderHints map[string]string
 }
 
-func OwnerRefFor(namespace, name string) string {
-	return fmt.Sprintf("%s/%s", namespace, name)
+// OwnerRefFor produces the canonical "<kind>:<namespace>/<name>" owner
+// reference that providers persist and the reconciler matches against.
+func OwnerRefFor(kind Kind, namespace, name string) string {
+	return fmt.Sprintf("%s:%s/%s", kind, namespace, name)
 }
 
 // Provider is the surface every DNS backend must implement.

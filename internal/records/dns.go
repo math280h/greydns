@@ -12,6 +12,8 @@ import (
 
 	"github.com/rs/zerolog/log"
 	v1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/math280h/greydns/internal/dnsprovider"
 	"github.com/math280h/greydns/internal/metrics"
@@ -324,14 +326,13 @@ func (r *Reconciler) cacheDelete(k CacheKey) {
 	metrics.CacheRecords.Set(float64(len(r.cache)))
 }
 
-// cacheOwnedBy returns a snapshot of every cached record whose OwnerRef
-// matches (namespace, name). Lookup is O(k) where k is the number of
-// records owned by the service.
-func (r *Reconciler) cacheOwnedBy(namespace, name string) []dnsprovider.Record {
-	owner := dnsprovider.OwnerRefFor(namespace, name)
+// cacheOwnedByRef returns a snapshot of every cached record whose
+// OwnerRef matches the given canonical owner reference. Lookup is O(k)
+// where k is the number of records owned by that ref.
+func (r *Reconciler) cacheOwnedByRef(ownerRef string) []dnsprovider.Record {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	keys := r.byOwner[owner]
+	keys := r.byOwner[ownerRef]
 	out := make([]dnsprovider.Record, 0, len(keys))
 	for _, k := range keys {
 		if rec, ok := r.cache[k]; ok {
@@ -376,39 +377,106 @@ func removeCacheKey(s []CacheKey, k CacheKey) []CacheKey {
 	return s
 }
 
-func dnsEnabled(service *v1.Service) bool {
-	return service.Annotations[AnnotationDNS] == "true"
+// target is the neutral shape every reconcile path operates on.
+// Service and Ingress handlers translate their resource into a target
+// so the core logic stays kind-agnostic; the kind is preserved in the
+// owner ref so cross-kind domain collisions surface as DuplicateDomain.
+type target struct {
+	kind        dnsprovider.Kind
+	namespace   string
+	name        string
+	annotations map[string]string
+	domains     []string
+	object      runtime.Object
 }
 
-func ownedBy(rec dnsprovider.Record, service *v1.Service) bool {
-	return rec.OwnerRef == dnsprovider.OwnerRefFor(service.Namespace, service.Name)
-}
-
-// preflight validates the greydns annotations on service and resolves
-// its zone and desired domain list.
-func (r *Reconciler) preflight(service *v1.Service) (string, []string, bool) {
-	if !dnsEnabled(service) {
-		return "", nil, false
+func targetFromService(svc *v1.Service) target {
+	return target{
+		kind:        dnsprovider.KindService,
+		namespace:   svc.Namespace,
+		name:        svc.Name,
+		annotations: svc.Annotations,
+		domains:     parseDomains(svc.Annotations[AnnotationDomain]),
+		object:      svc,
 	}
-	log.Info().Msgf("[DNS] Service %s has DNS enabled", service.Name)
+}
 
-	zoneName := service.Annotations[AnnotationZone]
+func targetFromIngress(ing *networkingv1.Ingress) target {
+	return target{
+		kind:        dnsprovider.KindIngress,
+		namespace:   ing.Namespace,
+		name:        ing.Name,
+		annotations: ing.Annotations,
+		domains:     uniqueHosts(ing.Spec.Rules),
+		object:      ing,
+	}
+}
+
+// uniqueHosts collects the set of non-empty spec.rules[].host values,
+// preserving the order of first appearance.
+func uniqueHosts(rules []networkingv1.IngressRule) []string {
+	if len(rules) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(rules))
+	out := make([]string, 0, len(rules))
+	for _, r := range rules {
+		host := strings.TrimSpace(r.Host)
+		if host == "" {
+			continue
+		}
+		if _, dup := seen[host]; dup {
+			continue
+		}
+		seen[host] = struct{}{}
+		out = append(out, host)
+	}
+	return out
+}
+
+func (t target) ownerRef() string {
+	return dnsprovider.OwnerRefFor(t.kind, t.namespace, t.name)
+}
+
+func (t target) dnsEnabled() bool {
+	return t.annotations[AnnotationDNS] == "true"
+}
+
+// preflight validates the greydns annotations on t and resolves its
+// zone. Domain resolution is done by the caller (Service reads the
+// greydns.io/domain CSV; Ingress reads spec.rules[].host), so preflight
+// only checks that at least one domain made it through.
+func (r *Reconciler) preflight(t target) (string, bool) {
+	if !t.dnsEnabled() {
+		return "", false
+	}
+	log.Info().Msgf("[DNS] %s %s/%s has DNS enabled", t.kind, t.namespace, t.name)
+
+	zoneName := t.annotations[AnnotationZone]
 	if zoneName == "" {
-		emitInvalidAnnotation(service, "greydns.io/zone is empty")
-		return "", nil, false
+		emitInvalidAnnotation(t, "greydns.io/zone is empty")
+		return "", false
 	}
 	zoneID, ok := r.zoneNameToID[zoneName]
 	if !ok {
-		log.Error().Msgf("[DNS] [%s] Zone %q not managed by provider", service.Name, zoneName)
-		return "", nil, false
+		log.Error().Msgf("[DNS] [%s/%s] Zone %q not managed by provider", t.namespace, t.name, zoneName)
+		return "", false
 	}
 
-	domains := parseDomains(service.Annotations[AnnotationDomain])
-	if len(domains) == 0 {
-		emitInvalidAnnotation(service, "greydns.io/domain is empty")
-		return "", nil, false
+	if len(t.domains) == 0 {
+		emitInvalidAnnotation(t, r.emptyDomainMessage(t))
+		return "", false
 	}
-	return zoneID, domains, true
+	return zoneID, true
+}
+
+// emptyDomainMessage tailors the InvalidAnnotation reason to the kind
+// so Ingress users aren't told to set a CSV that doesn't apply.
+func (r *Reconciler) emptyDomainMessage(t target) string {
+	if t.kind == dnsprovider.KindIngress {
+		return "spec.rules[].host is empty"
+	}
+	return "greydns.io/domain is empty"
 }
 
 // parseDomains splits a CSV annotation value into trimmed, deduped,
@@ -433,18 +501,18 @@ func parseDomains(raw string) []string {
 	return out
 }
 
-func emitDuplicateDomain(service *v1.Service) {
+func emitDuplicateDomain(t target) {
 	utils.Recorder.Eventf(
-		service,
+		t.object,
 		v1.EventTypeWarning,
 		"DuplicateDomain",
-		"Duplicate domain entry, this domain is already owned by another service",
+		"Duplicate domain entry, this domain is already owned by another resource",
 	)
 }
 
-func emitInvalidAnnotation(service *v1.Service, detail string) {
+func emitInvalidAnnotation(t target, detail string) {
 	utils.Recorder.Eventf(
-		service,
+		t.object,
 		v1.EventTypeWarning,
 		"InvalidAnnotation",
 		"Invalid greydns annotations: %s",
@@ -460,27 +528,38 @@ func emitInvalidAnnotation(service *v1.Service, detail string) {
 // backoff; returns nil for terminal outcomes (annotation-rejected,
 // fully reconciled) that require a new event to progress.
 func (r *Reconciler) Reconcile(ctx context.Context, service *v1.Service) error {
-	zoneID, domains, ok := r.preflight(service)
+	return r.reconcileTarget(ctx, targetFromService(service))
+}
+
+// ReconcileIngress is the Ingress-side counterpart to Reconcile. The
+// desired domain set is derived from spec.rules[].host; greydns.io/*
+// annotations (dns toggle, zone, ttl, overrides) still apply.
+func (r *Reconciler) ReconcileIngress(ctx context.Context, ingress *networkingv1.Ingress) error {
+	return r.reconcileTarget(ctx, targetFromIngress(ingress))
+}
+
+func (r *Reconciler) reconcileTarget(ctx context.Context, t target) error {
+	zoneID, ok := r.preflight(t)
 	if !ok {
 		return nil
 	}
 
-	desiredNames := make(map[string]struct{}, len(domains))
+	desiredNames := make(map[string]struct{}, len(t.domains))
 	allReconciled := true
-	for _, domain := range domains {
+	for _, domain := range t.domains {
 		desiredNames[domain] = struct{}{}
-		if !r.reconcileDomain(ctx, service, r.desiredRecord(service, zoneID, domain)) {
+		if !r.reconcileDomain(ctx, t, r.desiredRecord(t, zoneID, domain)) {
 			allReconciled = false
 		}
 	}
 
 	// Skip cleanup if any desired reconcile was blocked; deleting stale
-	// records while a rename target is contested would leave the
-	// Service with no DNS at all.
+	// records while a rename target is contested would leave the target
+	// with no DNS at all.
 	if !allReconciled {
 		return ErrReconcileIncomplete
 	}
-	r.cleanupOwnedOutsideDesired(ctx, service, zoneID, desiredNames)
+	r.cleanupOwnedOutsideDesired(ctx, t, zoneID, desiredNames)
 	return nil
 }
 
@@ -489,40 +568,40 @@ func (r *Reconciler) Reconcile(ctx context.Context, service *v1.Service) error {
 // blocked it (DuplicateDomain or a provider error).
 func (r *Reconciler) reconcileDomain(
 	ctx context.Context,
-	service *v1.Service,
+	t target,
 	desired dnsprovider.Record,
 ) bool {
 	existing, exists := r.CacheRecord(desired.ZoneID, desired.Name, desired.OwnerRef)
 	if !exists {
-		log.Info().Msgf("[DNS] [%s] Creating record %s", service.Name, desired.Name)
+		log.Info().Msgf("[DNS] [%s/%s] Creating record %s", t.namespace, t.name, desired.Name)
 		created, err := r.callProviderCreate(ctx, desired)
 		if err != nil {
 			metrics.Reconciles.WithLabelValues(metrics.OutcomeError).Inc()
-			log.Error().Err(err).Msgf("[DNS] [%s] Failed to create %s", service.Name, desired.Name)
+			log.Error().Err(err).Msgf("[DNS] [%s/%s] Failed to create %s", t.namespace, t.name, desired.Name)
 			return false
 		}
 		r.cacheSet(CacheKey{ZoneID: created.ZoneID, ID: created.ID}, created)
 		metrics.Reconciles.WithLabelValues(metrics.OutcomeCreated).Inc()
 		return true
 	}
-	if !ownedBy(existing, service) {
-		emitDuplicateDomain(service)
+	if existing.OwnerRef != t.ownerRef() {
+		emitDuplicateDomain(t)
 		metrics.Reconciles.WithLabelValues(metrics.OutcomeDuplicateDomain).Inc()
 		return false
 	}
 	if !hasDrift(existing, desired) {
-		log.Debug().Msgf("[DNS] [%s] %s matches desired state", service.Name, desired.Name)
+		log.Debug().Msgf("[DNS] [%s/%s] %s matches desired state", t.namespace, t.name, desired.Name)
 		metrics.Reconciles.WithLabelValues(metrics.OutcomeNoop).Inc()
 		return true
 	}
-	log.Info().Msgf("[DNS] [%s] Drift on %s, updating", service.Name, desired.Name)
+	log.Info().Msgf("[DNS] [%s/%s] Drift on %s, updating", t.namespace, t.name, desired.Name)
 	update := desired
 	update.ID = existing.ID
 	update.ZoneID = existing.ZoneID
 	updated, err := r.callProviderUpdate(ctx, update)
 	if err != nil {
 		metrics.Reconciles.WithLabelValues(metrics.OutcomeError).Inc()
-		log.Error().Err(err).Msgf("[DNS] [%s] Failed to update %s", service.Name, desired.Name)
+		log.Error().Err(err).Msgf("[DNS] [%s/%s] Failed to update %s", t.namespace, t.name, desired.Name)
 		return false
 	}
 	r.cacheSet(CacheKey{ZoneID: updated.ZoneID, ID: updated.ID}, updated)
@@ -530,69 +609,69 @@ func (r *Reconciler) reconcileDomain(
 	return true
 }
 
-// cleanupOwnedOutsideDesired deletes any record owned by this Service
-// that isn't at one of the desired names in the current zone. Handles
-// annotation removal (a domain dropped from the CSV), zone migration
-// (old-zone records no longer desired), and residue from prior failed
-// reconciles.
+// cleanupOwnedOutsideDesired deletes any record owned by t that isn't
+// at one of the desired names in the current zone. Handles annotation
+// removal (a domain dropped from the CSV or an Ingress rule), zone
+// migration (old-zone records no longer desired), and residue from
+// prior failed reconciles.
 func (r *Reconciler) cleanupOwnedOutsideDesired(
 	ctx context.Context,
-	service *v1.Service,
+	t target,
 	currentZoneID string,
 	desiredNames map[string]struct{},
 ) {
-	for _, rec := range r.cacheOwnedBy(service.Namespace, service.Name) {
+	for _, rec := range r.cacheOwnedByRef(t.ownerRef()) {
 		if rec.ZoneID == currentZoneID {
 			if _, keep := desiredNames[rec.Name]; keep {
 				continue
 			}
 		}
-		log.Info().Msgf("[DNS] [%s] Cleaning up stale record %s", service.Name, rec.Name)
-		r.deleteRecordOrRetry(ctx, service.Name, rec)
+		log.Info().Msgf("[DNS] [%s/%s] Cleaning up stale record %s", t.namespace, t.name, rec.Name)
+		r.deleteRecordOrRetry(ctx, t.namespace+"/"+t.name, rec)
 	}
 }
 
-func (r *Reconciler) desiredRecord(service *v1.Service, zoneID, domain string) dnsprovider.Record {
+func (r *Reconciler) desiredRecord(t target, zoneID, domain string) dnsprovider.Record {
 	return dnsprovider.Record{
 		ZoneID:        zoneID,
 		Name:          domain,
-		Type:          r.resolveRecordType(service),
+		Type:          r.resolveRecordType(t),
 		Content:       r.ingressDestination,
-		TTL:           r.resolveTTL(service),
-		OwnerRef:      dnsprovider.OwnerRefFor(service.Namespace, service.Name),
-		ProviderHints: r.collectProviderHints(service),
+		TTL:           r.resolveTTL(t),
+		OwnerRef:      t.ownerRef(),
+		ProviderHints: r.collectProviderHints(t),
 	}
 }
 
-func (r *Reconciler) resolveTTL(service *v1.Service) int {
-	raw := strings.TrimSpace(service.Annotations[AnnotationTTL])
+func (r *Reconciler) resolveTTL(t target) int {
+	raw := strings.TrimSpace(t.annotations[AnnotationTTL])
 	if raw == "" {
 		return r.recordTTL
 	}
 	if !r.overridePolicy.Allows("ttl") {
-		emitInvalidAnnotation(service, AnnotationTTL+": override not in allowed-overrides")
+		emitInvalidAnnotation(t, AnnotationTTL+": override not in allowed-overrides")
 		return r.recordTTL
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil || v <= 0 {
-		emitInvalidAnnotation(service, AnnotationTTL+": must be a positive integer, got "+raw)
+		emitInvalidAnnotation(t, AnnotationTTL+": must be a positive integer, got "+raw)
 		return r.recordTTL
 	}
 	return v
 }
 
-func (r *Reconciler) resolveRecordType(service *v1.Service) dnsprovider.RecordType {
-	raw := strings.TrimSpace(service.Annotations[AnnotationRecordType])
+func (r *Reconciler) resolveRecordType(t target) dnsprovider.RecordType {
+	raw := strings.TrimSpace(t.annotations[AnnotationRecordType])
 	if raw == "" {
 		return r.recordType
 	}
 	if !r.overridePolicy.Allows("record-type") {
-		emitInvalidAnnotation(service, AnnotationRecordType+": override not in allowed-overrides")
+		emitInvalidAnnotation(t, AnnotationRecordType+": override not in allowed-overrides")
 		return r.recordType
 	}
 	candidate := dnsprovider.RecordType(raw)
 	if err := dnsprovider.ValidateRecordType(candidate, r.provider.SupportedRecordTypes()); err != nil {
-		emitInvalidAnnotation(service, AnnotationRecordType+": "+err.Error())
+		emitInvalidAnnotation(t, AnnotationRecordType+": "+err.Error())
 		return r.recordType
 	}
 	return candidate
@@ -601,17 +680,17 @@ func (r *Reconciler) resolveRecordType(service *v1.Service) dnsprovider.RecordTy
 // collectProviderHints reads "greydns.io/<provider>-<key>" annotations
 // into a <key>-keyed map so the active provider sees a clean namespace.
 // Each full "<provider>-<key>" must be allowlisted.
-func (r *Reconciler) collectProviderHints(service *v1.Service) map[string]string {
+func (r *Reconciler) collectProviderHints(t target) map[string]string {
 	prefix := AnnotationPrefix + r.provider.Name() + "-"
 	hints := make(map[string]string)
-	for k, v := range service.Annotations {
+	for k, v := range t.annotations {
 		suffix, ok := strings.CutPrefix(k, prefix)
 		if !ok {
 			continue
 		}
 		policyKey := r.provider.Name() + "-" + suffix
 		if !r.overridePolicy.Allows(policyKey) {
-			emitInvalidAnnotation(service, k+": override not in allowed-overrides")
+			emitInvalidAnnotation(t, k+": override not in allowed-overrides")
 			continue
 		}
 		hints[suffix] = v
@@ -638,19 +717,27 @@ func hasDrift(existing, desired dnsprovider.Record) bool {
 	return false
 }
 
-// Cleanup removes every record owned by service (including in zones
-// the Service no longer references). Individual delete failures enter
-// the internal retry queue; Cleanup itself returns nil even when some
-// deletes fail so callers don't double-retry. The refresh loop's
-// DrainDeleteRetries is the outer retry path for those.
+// Cleanup removes every record owned by service. Individual delete
+// failures enter the internal retry queue; Cleanup itself returns nil
+// even when some deletes fail so callers don't double-retry. The
+// refresh loop's DrainDeleteRetries is the outer retry path for those.
 func (r *Reconciler) Cleanup(ctx context.Context, service *v1.Service) error {
-	owned := r.cacheOwnedBy(service.Namespace, service.Name)
+	return r.cleanupOwnerRef(ctx, dnsprovider.OwnerRefFor(dnsprovider.KindService, service.Namespace, service.Name))
+}
+
+// CleanupIngress is the Ingress-side counterpart to Cleanup.
+func (r *Reconciler) CleanupIngress(ctx context.Context, ingress *networkingv1.Ingress) error {
+	return r.cleanupOwnerRef(ctx, dnsprovider.OwnerRefFor(dnsprovider.KindIngress, ingress.Namespace, ingress.Name))
+}
+
+func (r *Reconciler) cleanupOwnerRef(ctx context.Context, ownerRef string) error {
+	owned := r.cacheOwnedByRef(ownerRef)
 	if len(owned) == 0 {
-		log.Debug().Msgf("[DNS] [%s] No owned records to delete", service.Name)
+		log.Debug().Msgf("[DNS] [%s] No owned records to delete", ownerRef)
 		return nil
 	}
 	for _, rec := range owned {
-		r.deleteRecordOrRetry(ctx, service.Name, rec)
+		r.deleteRecordOrRetry(ctx, ownerRef, rec)
 	}
 	return nil
 }

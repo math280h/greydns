@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 
@@ -59,6 +60,42 @@ func expectIncomplete(t *testing.T, r *records.Reconciler, svc *v1.Service) {
 	}
 }
 
+func mustReconcileIngress(t *testing.T, r *records.Reconciler, ing *networkingv1.Ingress) {
+	t.Helper()
+	if err := r.ReconcileIngress(context.Background(), ing); err != nil {
+		t.Fatalf("ReconcileIngress returned unexpected error: %v", err)
+	}
+}
+
+func mustCleanupIngress(t *testing.T, r *records.Reconciler, ing *networkingv1.Ingress) {
+	t.Helper()
+	if err := r.CleanupIngress(context.Background(), ing); err != nil {
+		t.Fatalf("CleanupIngress returned unexpected error: %v", err)
+	}
+}
+
+func ingress(name string, annotations map[string]string, hosts ...string) *networkingv1.Ingress {
+	rules := make([]networkingv1.IngressRule, 0, len(hosts))
+	for _, h := range hosts {
+		rules = append(rules, networkingv1.IngressRule{Host: h})
+	}
+	return &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   testNS,
+			Name:        name,
+			Annotations: annotations,
+		},
+		Spec: networkingv1.IngressSpec{Rules: rules},
+	}
+}
+
+func ingressAnnotations() map[string]string {
+	return map[string]string{
+		records.AnnotationDNS:  "true",
+		records.AnnotationZone: testZoneName,
+	}
+}
+
 func setupTest(t *testing.T) (*records.Reconciler, *fake.Provider, *record.FakeRecorder) {
 	t.Helper()
 	provider := fake.New(dnsprovider.Zone{ID: testZoneID, Name: testZoneName})
@@ -102,8 +139,8 @@ func TestHandleAnnotations_CreatesRecord(t *testing.T) {
 	if !ok {
 		t.Fatal("expected record in cache after create")
 	}
-	if rec.OwnerRef != "default/api" {
-		t.Fatalf("owner ref = %q, want default/api", rec.OwnerRef)
+	if rec.OwnerRef != "svc:default/api" {
+		t.Fatalf("owner ref = %q, want svc:default/api", rec.OwnerRef)
 	}
 	if len(provider.Snapshot()) != 1 {
 		t.Fatalf("provider should hold 1 record, has %d", len(provider.Snapshot()))
@@ -145,7 +182,7 @@ func TestHandleAnnotations_DuplicateDomainEmitsEvent(t *testing.T) {
 		ID:       "existing",
 		ZoneID:   testZoneID,
 		Name:     testDomain,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, "other"),
 	})
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
@@ -170,7 +207,7 @@ func TestHandleAnnotations_CleansUpStaleOwnedRecord(t *testing.T) {
 	stale := provider.Seed(dnsprovider.Record{
 		ZoneID:   testZoneID,
 		Name:     "old.example.com",
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	r.SeedCache(stale)
 
@@ -198,7 +235,7 @@ func TestHandleUpdates_UpdatesExisting(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  testIngress,
 		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
@@ -246,7 +283,7 @@ func TestHandleUpdates_RefusesToUpdateOtherServicesRecord(t *testing.T) {
 		ID:       "other-id",
 		ZoneID:   testZoneID,
 		Name:     testDomain,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, "other"),
 	})
 
 	newSvc := svc(dnsAnnotations(testZoneName, testDomain))
@@ -275,7 +312,7 @@ func TestHandleDeletions_DeletesOwnedRecord(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  testIngress,
 		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
@@ -299,7 +336,7 @@ func TestHandleDeletions_NoopOnForeignRecord(t *testing.T) {
 	existing := provider.Seed(dnsprovider.Record{
 		ZoneID:   testZoneID,
 		Name:     testDomain,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, "other"),
 	})
 	r.SeedCache(existing)
 
@@ -325,7 +362,7 @@ func TestHandleDeletions_WorksWhenDNSDisabled(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  testIngress,
 		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
@@ -354,7 +391,7 @@ func TestHandleDeletions_WorksWhenAnnotationsMissing(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  testIngress,
 		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
@@ -425,7 +462,7 @@ func TestHandleUpdates_RenameOntoOtherOwnerEmitsEvent(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  testIngress,
 		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	if err != nil {
 		t.Fatalf("seed mine: %v", err)
@@ -439,7 +476,7 @@ func TestHandleUpdates_RenameOntoOtherOwnerEmitsEvent(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  testIngress,
 		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, "other"),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, "other"),
 	})
 	if err != nil {
 		t.Fatalf("seed foreign: %v", err)
@@ -460,7 +497,7 @@ func TestHandleUpdates_RenameOntoOtherOwnerEmitsEvent(t *testing.T) {
 	}
 	// Foreign record untouched.
 	stillForeign, ok := r.CacheRecord(testZoneID, foreignDomain, "")
-	if !ok || stillForeign.OwnerRef != dnsprovider.OwnerRefFor(testNS, "other") {
+	if !ok || stillForeign.OwnerRef != dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, "other") {
 		t.Fatal("foreign record should still be owned by the other service")
 	}
 	// Original record still in place (rename aborted).
@@ -496,7 +533,7 @@ func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  testIngress,
 		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
@@ -538,14 +575,14 @@ func TestCache_PreservesDuplicateNamesInSameZone(t *testing.T) {
 		ZoneID:   testZoneID,
 		Name:     testDomain,
 		Content:  "1.1.1.1",
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	r.SeedCache(dnsprovider.Record{
 		ID:       "rec-2",
 		ZoneID:   testZoneID,
 		Name:     testDomain,
 		Content:  "2.2.2.2",
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 
 	if r.CacheLen() != 2 {
@@ -593,7 +630,7 @@ func TestHandleDeletions_RetriesFailedDeletes(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  testIngress,
 		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
@@ -659,7 +696,7 @@ func TestHandleDeletions_DedupesRepeatedEnqueues(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  testIngress,
 		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 
 	svcObj := svc(dnsAnnotations(testZoneName, testDomain))
@@ -714,7 +751,7 @@ func TestReconciler_CacheConcurrentAccess(t *testing.T) {
 					Type:     dnsprovider.RecordTypeA,
 					Content:  testIngress,
 					TTL:      60,
-					OwnerRef: dnsprovider.OwnerRefFor(testNS, fmt.Sprintf("svc-%d-%d", id, i)),
+					OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, fmt.Sprintf("svc-%d-%d", id, i)),
 				})
 				_, _ = r.CacheRecord(testZoneID, name, "")
 			}
@@ -749,7 +786,7 @@ func TestHandleAnnotations_ReconcilesDriftedRecord(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  "9.9.9.9", // differs from testIngress
 		TTL:      300,       // differs from Reconciler.recordTTL (60)
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
@@ -758,7 +795,8 @@ func TestHandleAnnotations_ReconcilesDriftedRecord(t *testing.T) {
 
 	mustReconcile(t, r, svc(dnsAnnotations(testZoneName, testDomain)))
 
-	reconciled, ok := r.CacheRecord(testZoneID, testDomain, dnsprovider.OwnerRefFor(testNS, testSvcName))
+	owner := dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName)
+	reconciled, ok := r.CacheRecord(testZoneID, testDomain, owner)
 	if !ok {
 		t.Fatal("reconciled record missing from cache")
 	}
@@ -1010,7 +1048,7 @@ func TestHandleAnnotations_TTLOverrideDriftTriggersUpdate(t *testing.T) {
 		Type:     dnsprovider.RecordTypeA,
 		Content:  testIngress,
 		TTL:      60,
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, testSvcName),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, testSvcName),
 	})
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
@@ -1101,6 +1139,151 @@ func TestHandleUpdates_DroppedDomainGetsCleanedUp(t *testing.T) {
 	}
 }
 
+func TestReconcileIngress_CreatesRecordsForSpecHosts(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	ing := ingress("web", ingressAnnotations(), "a.example.com", "b.example.com")
+	mustReconcileIngress(t, r, ing)
+
+	snap := provider.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("want 2 records from spec.rules, got %d", len(snap))
+	}
+	want := dnsprovider.OwnerRefFor(dnsprovider.KindIngress, testNS, "web")
+	for _, rec := range snap {
+		if rec.OwnerRef != want {
+			t.Fatalf("owner ref = %q, want %q", rec.OwnerRef, want)
+		}
+	}
+}
+
+func TestReconcileIngress_EmptyHostListEmitsEvent(t *testing.T) {
+	r, provider, recorder := setupTest(t)
+
+	ing := ingress("web", ingressAnnotations())
+	mustReconcileIngress(t, r, ing)
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "InvalidAnnotation") {
+			t.Fatalf("want InvalidAnnotation event, got %q", ev)
+		}
+	default:
+		t.Fatal("expected InvalidAnnotation event, got none")
+	}
+	if len(provider.Snapshot()) != 0 {
+		t.Fatal("provider should not have been called")
+	}
+}
+
+func TestReconcileIngress_DedupesDuplicateHosts(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	ing := ingress("web", ingressAnnotations(), "a.example.com", "a.example.com", "b.example.com")
+	mustReconcileIngress(t, r, ing)
+
+	if len(provider.Snapshot()) != 2 {
+		t.Fatalf("duplicate host should be deduped, got %d records", len(provider.Snapshot()))
+	}
+}
+
+func TestReconcileIngress_DroppedHostCleansUp(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	mustReconcileIngress(t, r,
+		ingress("web", ingressAnnotations(), "a.example.com", "b.example.com"))
+	if len(provider.Snapshot()) != 2 {
+		t.Fatalf("setup: want 2 records, got %d", len(provider.Snapshot()))
+	}
+
+	mustReconcileIngress(t, r,
+		ingress("web", ingressAnnotations(), "a.example.com"))
+
+	snap := provider.Snapshot()
+	if len(snap) != 1 || snap[0].Name != "a.example.com" {
+		t.Fatalf("dropped host should be cleaned up, got %+v", snap)
+	}
+}
+
+func TestReconcileIngress_AppliesTTLOverride(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	ing := ingress("web", ingressAnnotations(), testDomain)
+	ing.Annotations[records.AnnotationTTL] = "900"
+	mustReconcileIngress(t, r, ing)
+
+	snap := provider.Snapshot()
+	if len(snap) != 1 || snap[0].TTL != 900 {
+		t.Fatalf("TTL override not applied, got %+v", snap)
+	}
+}
+
+func TestReconcileIngress_ServiceSameNameDoesNotCollide(t *testing.T) {
+	// Regression: an Ingress and a Service sharing namespace/name must
+	// own disjoint records. Deleting the Service must not remove the
+	// Ingress's records (and vice versa), and both can own the same
+	// domain only if no DuplicateDomain fires (but they claim different
+	// domains in this test to avoid that path).
+	r, provider, _ := setupTest(t)
+
+	mustReconcile(t, r, svc(dnsAnnotations(testZoneName, "svc.example.com")))
+	mustReconcileIngress(t, r,
+		ingress(testSvcName, ingressAnnotations(), "ing.example.com"))
+
+	if len(provider.Snapshot()) != 2 {
+		t.Fatalf("both records should coexist, got %d", len(provider.Snapshot()))
+	}
+
+	mustCleanup(t, r, svc(dnsAnnotations(testZoneName, "svc.example.com")))
+	snap := provider.Snapshot()
+	if len(snap) != 1 || snap[0].Name != "ing.example.com" {
+		t.Fatalf("Service cleanup should leave the Ingress record intact, got %+v", snap)
+	}
+}
+
+func TestReconcileIngress_DuplicateOfServiceDomainEmitsEvent(t *testing.T) {
+	// Cross-kind duplicate: a Service already owns a domain; an Ingress
+	// claiming the same host must be blocked with DuplicateDomain.
+	r, _, recorder := setupTest(t)
+
+	mustReconcile(t, r, svc(dnsAnnotations(testZoneName, testDomain)))
+	// drain create event
+	select {
+	case <-recorder.Events:
+	default:
+	}
+
+	ing := ingress("web", ingressAnnotations(), testDomain)
+	if err := r.ReconcileIngress(context.Background(), ing); !errors.Is(err, records.ErrReconcileIncomplete) {
+		t.Fatalf("ReconcileIngress err = %v, want ErrReconcileIncomplete", err)
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "DuplicateDomain") {
+			t.Fatalf("expected DuplicateDomain event, got %q", ev)
+		}
+	default:
+		t.Fatal("expected DuplicateDomain event, got none")
+	}
+}
+
+func TestCleanupIngress_DeletesOwnedRecords(t *testing.T) {
+	r, provider, _ := setupTest(t)
+
+	ing := ingress("web", ingressAnnotations(), testDomain)
+	mustReconcileIngress(t, r, ing)
+	if len(provider.Snapshot()) != 1 {
+		t.Fatalf("setup: want 1 record, got %d", len(provider.Snapshot()))
+	}
+
+	mustCleanupIngress(t, r, ing)
+
+	if len(provider.Snapshot()) != 0 {
+		t.Fatal("Ingress record should be deleted")
+	}
+}
+
 func TestHandleUpdates_ContestedNewDomainPreservesOldRecords(t *testing.T) {
 	// Regression: if one of the new domains is owned by a peer, the
 	// reconciler must NOT delete the old records while the rename is
@@ -1116,7 +1299,7 @@ func TestHandleUpdates_ContestedNewDomainPreservesOldRecords(t *testing.T) {
 		ID:       "peer-id",
 		ZoneID:   testZoneID,
 		Name:     "b.example.com",
-		OwnerRef: dnsprovider.OwnerRefFor(testNS, "peer"),
+		OwnerRef: dnsprovider.OwnerRefFor(dnsprovider.KindService, testNS, "peer"),
 	})
 
 	newSvc := svc(dnsAnnotations(testZoneName, "b.example.com"))

@@ -230,15 +230,36 @@ func (p *Provider) fromResponse(zoneID string, resp *dns.RecordResponse) dnsprov
 }
 
 // parseOwner returns ok=false unless the comment starts with the
-// greydns marker and its suffix is a non-empty "<namespace>/<name>".
+// greydns marker and its suffix is a well-formed owner ref. Both the
+// kind-prefixed "<kind>:<namespace>/<name>" form (written by this
+// version) and the legacy bare "<namespace>/<name>" form (pre-Ingress
+// support) are accepted; legacy records are read as Service-owned and
+// get rewritten to the new format on the next update.
 func parseOwner(comment string) (string, bool) {
 	suffix, ok := strings.CutPrefix(comment, commentMarker)
 	if !ok {
 		return "", false
 	}
-	namespace, name, hasSlash := strings.Cut(suffix, "/")
-	if !hasSlash || namespace == "" || name == "" || strings.Contains(name, "/") {
+	if kindPart, rest, hasColon := strings.Cut(suffix, ":"); hasColon {
+		if !isKnownKind(kindPart) || !isValidNsName(rest) {
+			return "", false
+		}
+		return suffix, true
+	}
+	if !isValidNsName(suffix) {
 		return "", false
 	}
-	return suffix, true
+	return string(dnsprovider.KindService) + ":" + suffix, true
+}
+
+func isKnownKind(s string) bool {
+	return s == string(dnsprovider.KindService) || s == string(dnsprovider.KindIngress)
+}
+
+func isValidNsName(s string) bool {
+	namespace, name, hasSlash := strings.Cut(s, "/")
+	if !hasSlash || namespace == "" || name == "" || strings.Contains(name, "/") {
+		return false
+	}
+	return true
 }
