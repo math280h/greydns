@@ -2,6 +2,20 @@ package cloudflare
 
 import "testing"
 
+func TestNormalizeName(t *testing.T) {
+	cases := map[string]string{
+		"api.example.com":  "api.example.com",
+		"api.example.com.": "api.example.com",
+		"":                 "",
+		".":                "",
+	}
+	for in, want := range cases {
+		if got := normalizeName(in); got != want {
+			t.Errorf("normalizeName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestParseOwner(t *testing.T) {
 	cases := []struct {
 		name    string

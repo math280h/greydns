@@ -1,5 +1,5 @@
-# syntax=docker/dockerfile:1.7
-FROM golang:1.24 AS builder
+# syntax=docker/dockerfile:1.7s
+FROM golang:1.24@sha256:d2d2bc1c84f7e60d7d2438a3836ae7d0c847f4888464e7ec9ba3a1339a1ee804 AS builder
 
 WORKDIR /src
 
@@ -12,7 +12,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w" \
     -o /out/controller ./cmd
 
-FROM gcr.io/distroless/static:nonroot
+FROM gcr.io/distroless/static:nonroot@sha256:e3f945647ffb95b5839c07038d64f9811adf17308b9121d8a2b87b6a22a80a39
 
 COPY --from=builder /out/controller /controller
 

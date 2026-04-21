@@ -1139,6 +1139,28 @@ func TestHandleUpdates_DroppedDomainGetsCleanedUp(t *testing.T) {
 	}
 }
 
+func TestHandleAnnotations_ZoneLookupIsCaseInsensitive(t *testing.T) {
+	// Regression: DNS is case-insensitive; a Service annotating
+	// "Example.COM" should resolve to the same zone as "example.com".
+	stubRecorder(t)
+	provider := fake.New(dnsprovider.Zone{ID: testZoneID, Name: testZoneName})
+	r := records.NewReconciler(
+		provider,
+		map[string]string{strings.ToLower(testZoneName): testZoneID},
+		testIngress,
+		60,
+		dnsprovider.RecordTypeA,
+		records.NewOverridePolicy("", false),
+	)
+
+	s := svc(dnsAnnotations("EXAMPLE.com", testDomain))
+	mustReconcile(t, r, s)
+
+	if len(provider.Snapshot()) != 1 {
+		t.Fatalf("uppercase zone should resolve, got %d records", len(provider.Snapshot()))
+	}
+}
+
 func TestReconcileIngress_CreatesRecordsForSpecHosts(t *testing.T) {
 	r, provider, _ := setupTest(t)
 
