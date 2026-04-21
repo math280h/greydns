@@ -109,7 +109,7 @@ func (p *Provider) ListOwnedRecords(ctx context.Context, zoneID string) ([]dnspr
 		out = append(out, dnsprovider.Record{
 			ID:            rec.ID,
 			ZoneID:        zoneID,
-			Name:          rec.Name,
+			Name:          normalizeName(rec.Name),
 			Type:          dnsprovider.RecordType(rec.Type),
 			Content:       rec.Content,
 			TTL:           int(rec.TTL),
@@ -220,13 +220,18 @@ func (p *Provider) fromResponse(zoneID string, resp *dns.RecordResponse) dnsprov
 	return dnsprovider.Record{
 		ID:            resp.ID,
 		ZoneID:        zoneID,
-		Name:          resp.Name,
+		Name:          normalizeName(resp.Name),
 		Type:          dnsprovider.RecordType(resp.Type),
 		Content:       resp.Content,
 		TTL:           int(resp.TTL),
 		OwnerRef:      owner,
 		ProviderHints: map[string]string{hintProxied: strconv.FormatBool(resp.Proxied)},
 	}
+}
+
+// normalizeName strips the trailing dot Cloudflare occasionally returns.
+func normalizeName(name string) string {
+	return strings.TrimSuffix(name, ".")
 }
 
 // parseOwner returns ok=false unless the comment starts with the

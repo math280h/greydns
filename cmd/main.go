@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -268,7 +269,7 @@ func mustListZones(ctx context.Context, provider dnsprovider.Provider) map[strin
 	}
 	out := make(map[string]string, len(zones))
 	for _, z := range zones {
-		out[z.Name] = z.ID
+		out[strings.ToLower(z.Name)] = z.ID
 		log.Debug().Msgf("[Core] Found zone: %s (ID: %s)", z.Name, z.ID)
 	}
 	log.Info().Msgf("[Core] Found %d zones", len(out))

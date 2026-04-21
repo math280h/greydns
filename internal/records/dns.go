@@ -457,7 +457,7 @@ func (r *Reconciler) preflight(t target) (string, bool) {
 		emitInvalidAnnotation(t, "greydns.io/zone is empty")
 		return "", false
 	}
-	zoneID, ok := r.zoneNameToID[zoneName]
+	zoneID, ok := r.zoneNameToID[strings.ToLower(zoneName)]
 	if !ok {
 		log.Error().Msgf("[DNS] [%s/%s] Zone %q not managed by provider", t.namespace, t.name, zoneName)
 		return "", false
