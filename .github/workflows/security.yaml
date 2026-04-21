@@ -46,12 +46,12 @@ jobs:
       - name: 🔧 Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
 
       - name: 🔎 govulncheck
         uses: golang/govulncheck-action@v1
         with:
-          go-version-input: '1.24'
+          go-version-input: '1.26'
           go-package: ./...
 
   grype:
