@@ -17,7 +17,7 @@ jobs:
     name: Semgrep
     steps:
       - name: 🔔 Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: 🔎 semgrep scan
         run: |
@@ -41,7 +41,7 @@ jobs:
     name: govulncheck
     steps:
       - name: 🔔 Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: 🔧 Setup Go
         uses: actions/setup-go@v5
@@ -59,7 +59,7 @@ jobs:
     name: Grype
     steps:
       - name: 🔔 Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: 🔧 Setup Buildx
         uses: docker/setup-buildx-action@v3

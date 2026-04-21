@@ -11,7 +11,7 @@ jobs:
     name: Lint
     steps:
       - name: 🔔 Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -22,16 +22,16 @@ jobs:
           cache: false
 
       - name: ✨ golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v8
         with:
-          version: v1.64.8
+          version: v2.11.4
 
   test:
     runs-on: ubuntu-latest
     name: Test
     steps:
       - name: 🔔 Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: 🔧 Setup Go
         uses: actions/setup-go@v5
