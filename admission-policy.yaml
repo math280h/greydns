@@ -1,0 +1,54 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: greydns-annotations
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["services"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["ingresses"]
+  matchConditions:
+    - name: has-greydns-annotation
+      expression: >-
+        has(object.metadata.annotations) &&
+        object.metadata.annotations.exists(k, k.startsWith('greydns.io/'))
+  validations:
+    - expression: >-
+        !('greydns.io/dns' in object.metadata.annotations) ||
+        object.metadata.annotations['greydns.io/dns'] in ['true', 'false']
+      message: 'greydns.io/dns must be "true" or "false"'
+    - expression: >-
+        !('greydns.io/ttl' in object.metadata.annotations) ||
+        object.metadata.annotations['greydns.io/ttl'].trim() == '' ||
+        object.metadata.annotations['greydns.io/ttl'].trim().matches('^0*[1-9][0-9]*$')
+      message: 'greydns.io/ttl must be a positive integer'
+    - expression: >-
+        !('greydns.io/record-type' in object.metadata.annotations) ||
+        object.metadata.annotations['greydns.io/record-type'].trim() == '' ||
+        object.metadata.annotations['greydns.io/record-type'].trim() in ['A', 'AAAA', 'CNAME']
+      message: 'greydns.io/record-type must be A, AAAA, or CNAME'
+    - expression: >-
+        !('greydns.io/zone' in object.metadata.annotations) ||
+        object.metadata.annotations['greydns.io/zone'].matches('^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+\\.?$')
+      message: 'greydns.io/zone must be a valid DNS name'
+    - expression: >-
+        !('greydns.io/domain' in object.metadata.annotations) ||
+        object.metadata.annotations['greydns.io/domain'].split(',').all(d,
+          d.trim() == '' ||
+          d.trim().matches('^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+\\.?$'))
+      message: 'greydns.io/domain entries must all be valid DNS names'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: greydns-annotations
+spec:
+  policyName: greydns-annotations
+  validationActions: ["Deny"]

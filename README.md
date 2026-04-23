@@ -160,6 +160,24 @@ GreyDNS will create an event on the service if it detects a record that is alrea
 
 ![Duplicate Record](assets/duplicate.png)
 
+### Admission-time annotation validation (optional)
+
+`admission-policy.yaml` ships a `ValidatingAdmissionPolicy` that rejects malformed values on the core `greydns.io/*` annotations (`dns`, `zone`, `domain`, `ttl`, `record-type`) at `kubectl apply` time, so typos surface immediately instead of landing as `InvalidAnnotation` events at reconcile. Provider-scoped keys like `greydns.io/cloudflare-proxied` are passed through untouched. It's optional and independent of the controller; apply it alongside the deployment if you want upfront feedback:
+
+```bash
+kubectl apply -f admission-policy.yaml
+```
+
+Requires Kubernetes 1.30+ (GA `admissionregistration.k8s.io/v1`). The policy rejects:
+
+- `greydns.io/dns` not in `"true"` / `"false"`
+- `greydns.io/ttl` not a positive integer
+- `greydns.io/record-type` not in `A` / `AAAA` / `CNAME`
+- `greydns.io/zone` that isn't a valid DNS name
+- `greydns.io/domain` with any CSV entry that isn't a valid DNS name
+
+Objects without any `greydns.io/*` annotation skip the policy entirely via a match condition, so the overhead for unrelated Services and Ingresses is a single CEL check.
+
 ## 🔍 Configuration
 
 ### Generic keys
