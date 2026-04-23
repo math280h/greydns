@@ -30,6 +30,7 @@ flowchart LR
 - **Real-time Updates**: Automatically syncs DNS records when annotations change
 - **Lightweight**: Minimal resource footprint with efficient caching
 - **Observable**: Prometheus metrics exposed on `/metrics` alongside the health probes on port `8080`
+- **Hot-reloadable Config**: Edit `greydns-config` and the controller picks up generic keys (TTL, record-type, ingress-destination, allowed-overrides) without a pod restart
 
 ## 📦 Supported DNS Providers
 
@@ -165,14 +166,16 @@ GreyDNS will create an event on the service if it detects a record that is alrea
 
 Universal DNS concepts live at the top level so they're not duplicated across providers.
 
-| Config Key | Description | Required |
-|------------|-------------|----------|
-| `provider` | Active provider name (today: `cloudflare`) | Yes |
-| `record-type` | Default record type (`A`, `AAAA`, `CNAME`, ...). Overridable per Service via `greydns.io/record-type`. | Yes |
-| `record-ttl` | Default TTL in seconds. Overridable per Service via `greydns.io/ttl`. | Yes |
-| `cache-refresh-seconds` | Cache refresh interval | Yes |
-| `ingress-destination` | Ingress controller IP address or hostname | Yes |
-| `allowed-overrides` | Allowlist of per-Service override suffixes (CSV). Missing key or `*` allows every override; explicit empty string denies every override; otherwise only the listed suffixes (e.g. `ttl,record-type,cloudflare-proxied`) are honoured. Enforced in-process, so Service editors can't bypass it. | No (default allow all) |
+| Config Key | Description | Required | Hot-reloadable |
+|------------|-------------|----------|----------------|
+| `provider` | Active provider name (today: `cloudflare`) | Yes | No (restart) |
+| `record-type` | Default record type (`A`, `AAAA`, `CNAME`, ...). Overridable per Service via `greydns.io/record-type`. | Yes | Yes |
+| `record-ttl` | Default TTL in seconds. Overridable per Service via `greydns.io/ttl`. | Yes | Yes |
+| `cache-refresh-seconds` | Cache refresh interval | Yes | No (restart) |
+| `ingress-destination` | Ingress controller IP address or hostname | Yes | Yes |
+| `allowed-overrides` | Allowlist of per-Service override suffixes (CSV). Missing key or `*` allows every override; explicit empty string denies every override; otherwise only the listed suffixes (e.g. `ttl,record-type,cloudflare-proxied`) are honoured. Enforced in-process, so Service editors can't bypass it. | No (default allow all) | Yes |
+
+Editing `greydns-config` triggers a ConfigMap informer event; the controller re-parses, swaps its in-memory snapshot, and enqueues every watched Service and Ingress for re-reconcile so existing records converge on the new values within seconds (no pod restart, no per-resource bounce). Invalid values are logged and rejected; the previous snapshot stays in force until the config is fixed. Provider credentials and the `provider` key still require a pod restart.
 
 ### Cloudflare keys (`provider: cloudflare`)
 
@@ -188,7 +191,7 @@ Prometheus metrics are served on `GET /metrics` on the same port (`8080`) as the
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `greydns_reconciles_total` | counter | `outcome` | Reconciliations grouped by outcome: `created`, `updated`, `noop`, `duplicate_domain`, `invalid_annotation`, `skipped_stale_cache`, `error`. |
+| `greydns_reconciles_total` | counter | `outcome` | Reconciliations grouped by outcome: `created`, `updated`, `noop`, `duplicate_domain`, `invalid_annotation`, `error`. |
 | `greydns_provider_calls_total` | counter | `provider`, `operation`, `outcome` | Provider API calls; `operation` is one of `list_zones`, `list_owned`, `create`, `update`, `delete`; `outcome` is `success` or `error`. |
 | `greydns_provider_call_duration_seconds` | histogram | `provider`, `operation` | Provider API call latency. |
 | `greydns_cache_records` | gauge | - | Number of DNS records currently in the controller cache. |

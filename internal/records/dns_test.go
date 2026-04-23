@@ -103,10 +103,12 @@ func setupTest(t *testing.T) (*records.Reconciler, *fake.Provider, *record.FakeR
 	r := records.NewReconciler(
 		provider,
 		map[string]string{testZoneName: testZoneID},
-		testIngress,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("", false),
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: testIngress,
+			OverridePolicy:     records.NewOverridePolicy("", false),
+		},
 	)
 	return r, provider, recorder
 }
@@ -521,10 +523,12 @@ func TestHandleUpdates_ZoneChangeMigratesRecord(t *testing.T) {
 	r := records.NewReconciler(
 		provider,
 		map[string]string{testZoneName: testZoneID, otherZoneName: otherZoneID},
-		testIngress,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("", false),
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: testIngress,
+			OverridePolicy:     records.NewOverridePolicy("", false),
+		},
 	)
 
 	existing, err := provider.CreateRecord(context.Background(), dnsprovider.Record{
@@ -618,10 +622,12 @@ func TestHandleDeletions_RetriesFailedDeletes(t *testing.T) {
 	r := records.NewReconciler(
 		rigged,
 		map[string]string{testZoneName: testZoneID},
-		testIngress,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("", false),
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: testIngress,
+			OverridePolicy:     records.NewOverridePolicy("", false),
+		},
 	)
 
 	existing, err := base.CreateRecord(context.Background(), dnsprovider.Record{
@@ -683,10 +689,12 @@ func TestHandleDeletions_DedupesRepeatedEnqueues(t *testing.T) {
 	r := records.NewReconciler(
 		prov,
 		map[string]string{testZoneName: testZoneID},
-		testIngress,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("", false),
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: testIngress,
+			OverridePolicy:     records.NewOverridePolicy("", false),
+		},
 	)
 
 	r.SeedCache(dnsprovider.Record{
@@ -726,10 +734,12 @@ func TestReconciler_CacheConcurrentAccess(t *testing.T) {
 	r := records.NewReconciler(
 		provider,
 		map[string]string{testZoneName: testZoneID},
-		testIngress,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("", false),
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: testIngress,
+			OverridePolicy:     records.NewOverridePolicy("", false),
+		},
 	)
 
 	const workers = 8
@@ -979,10 +989,12 @@ func TestHandleAnnotations_TTLOverrideBlockedByPolicy(t *testing.T) {
 	r := records.NewReconciler(
 		provider,
 		map[string]string{testZoneName: testZoneID},
-		testIngress,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("record-type", true),
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: testIngress,
+			OverridePolicy:     records.NewOverridePolicy("record-type", true),
+		},
 	)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
@@ -1011,10 +1023,12 @@ func TestHandleAnnotations_ProviderHintBlockedByPolicy(t *testing.T) {
 	r := records.NewReconciler(
 		provider,
 		map[string]string{testZoneName: testZoneID},
-		testIngress,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("ttl", true),
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: testIngress,
+			OverridePolicy:     records.NewOverridePolicy("ttl", true),
+		},
 	)
 
 	s := svc(dnsAnnotations(testZoneName, testDomain))
@@ -1147,10 +1161,12 @@ func TestHandleAnnotations_ZoneLookupIsCaseInsensitive(t *testing.T) {
 	r := records.NewReconciler(
 		provider,
 		map[string]string{strings.ToLower(testZoneName): testZoneID},
-		testIngress,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("", false),
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: testIngress,
+			OverridePolicy:     records.NewOverridePolicy("", false),
+		},
 	)
 
 	s := svc(dnsAnnotations("EXAMPLE.com", testDomain))

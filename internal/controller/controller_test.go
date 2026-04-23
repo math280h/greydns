@@ -44,10 +44,12 @@ func newRig(t *testing.T) *itRig {
 	reconciler := records.NewReconciler(
 		provider,
 		map[string]string{itZoneName: itZoneID},
-		itIngressDst,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("", false),
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: itIngressDst,
+			OverridePolicy:     records.NewOverridePolicy("", false),
+		},
 	)
 	recorder := krecord.NewFakeRecorder(32)
 	prev := utils.Recorder
@@ -357,10 +359,12 @@ func TestController_WorkqueueRetriesOnProviderError(t *testing.T) {
 	reconciler := records.NewReconciler(
 		prov,
 		map[string]string{itZoneName: itZoneID},
-		itIngressDst,
-		60,
-		dnsprovider.RecordTypeA,
-		records.NewOverridePolicy("", false),
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: itIngressDst,
+			OverridePolicy:     records.NewOverridePolicy("", false),
+		},
 	)
 	prev := utils.Recorder
 	utils.Recorder = krecord.NewFakeRecorder(32) //nolint:reassign // test stubs the event recorder

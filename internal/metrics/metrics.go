@@ -22,7 +22,6 @@ const (
 	OutcomeNoop              = "noop"
 	OutcomeDuplicateDomain   = "duplicate_domain"
 	OutcomeInvalidAnnotation = "invalid_annotation"
-	OutcomeSkippedStaleCache = "skipped_stale_cache"
 	OutcomeError             = "error"
 )
 

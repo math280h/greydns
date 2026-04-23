@@ -110,6 +110,12 @@ rules:
     resources: ["configmaps"]
     resourceNames: ["greydns-config"]
     verbs: ["get"]
+  # list/watch cannot be scoped by resourceNames in RBAC, so they
+  # apply to every ConfigMap in the namespace. The informer itself
+  # restricts its cache to greydns-config via a FieldSelector.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["list", "watch"]
   - apiGroups: [""]
     resources: ["secrets"]
     resourceNames: ["greydns-secret"]
