@@ -8,7 +8,6 @@ GreyDNS enables development teams to manage their DNS records directly through K
 
 ![Go Version](https://img.shields.io/badge/go-1.26-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
-[![Coverage](https://codecov.io/gh/math280h/greydns/graph/badge.svg)](https://codecov.io/gh/math280h/greydns)
 
 ```mermaid
 flowchart LR
