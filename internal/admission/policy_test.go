@@ -8,39 +8,40 @@ import (
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/ext"
-	"sigs.k8s.io/yaml"
+	"gopkg.in/yaml.v3"
 )
 
 type validation struct {
-	Expression string `json:"expression"`
-	Message    string `json:"message"`
+	Expression string `yaml:"expression"`
+	Message    string `yaml:"message"`
 }
 
 type matchCondition struct {
-	Name       string `json:"name"`
-	Expression string `json:"expression"`
+	Name       string `yaml:"name"`
+	Expression string `yaml:"expression"`
 }
 
 type policy struct {
 	Spec struct {
-		MatchConditions []matchCondition `json:"matchConditions"`
-		Validations     []validation     `json:"validations"`
-	} `json:"spec"`
+		MatchConditions []matchCondition `yaml:"matchConditions"`
+		Validations     []validation     `yaml:"validations"`
+	} `yaml:"spec"`
 }
 
 func loadPolicy(t *testing.T) policy {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "admission-policy.yaml"))
+	f, err := os.Open(filepath.Join("..", "..", "admission-policy.yaml"))
 	if err != nil {
-		t.Fatalf("read policy: %v", err)
+		t.Fatalf("open policy: %v", err)
 	}
-	first := strings.SplitN(string(data), "\n---\n", 2)[0]
+	defer f.Close()
+	dec := yaml.NewDecoder(f)
 	var p policy
-	if uerr := yaml.Unmarshal([]byte(first), &p); uerr != nil {
-		t.Fatalf("unmarshal policy: %v", uerr)
+	if derr := dec.Decode(&p); derr != nil {
+		t.Fatalf("decode policy: %v", derr)
 	}
-	if len(p.Spec.Validations) == 0 {
-		t.Fatal("policy loaded with zero validations")
+	if p.Spec.Validations == nil {
+		t.Fatal("first YAML document is not the ValidatingAdmissionPolicy")
 	}
 	return p
 }
@@ -102,7 +103,12 @@ func TestPolicy_AcceptsValidAnnotations(t *testing.T) {
 		{"dns_false", map[string]string{"greydns.io/dns": "false"}},
 		{"ttl_1", map[string]string{"greydns.io/dns": "true", "greydns.io/ttl": "1"}},
 		{"ttl_300", map[string]string{"greydns.io/dns": "true", "greydns.io/ttl": "300"}},
+		{"ttl_leading_zeros", map[string]string{"greydns.io/dns": "true", "greydns.io/ttl": "0300"}},
+		{"ttl_whitespace", map[string]string{"greydns.io/dns": "true", "greydns.io/ttl": "  300  "}},
+		{"ttl_empty_ignored", map[string]string{"greydns.io/dns": "true", "greydns.io/ttl": ""}},
 		{"record_type_A", map[string]string{"greydns.io/dns": "true", "greydns.io/record-type": "A"}},
+		{"record_type_whitespace", map[string]string{"greydns.io/dns": "true", "greydns.io/record-type": " A "}},
+		{"record_type_empty_ignored", map[string]string{"greydns.io/dns": "true", "greydns.io/record-type": ""}},
 		{"record_type_AAAA", map[string]string{"greydns.io/dns": "true", "greydns.io/record-type": "AAAA"}},
 		{"record_type_CNAME", map[string]string{"greydns.io/dns": "true", "greydns.io/record-type": "CNAME"}},
 		{"zone_basic", map[string]string{"greydns.io/dns": "true", "greydns.io/zone": "example.com"}},
@@ -152,7 +158,7 @@ func TestPolicy_RejectsInvalidAnnotations(t *testing.T) {
 		{"dns_1", map[string]string{"greydns.io/dns": "1"}, "greydns.io/dns"},
 		{"dns_True_wrong_case", map[string]string{"greydns.io/dns": "True"}, "greydns.io/dns"},
 		{"ttl_zero", map[string]string{"greydns.io/ttl": "0"}, "greydns.io/ttl"},
-		{"ttl_leading_zero", map[string]string{"greydns.io/ttl": "01"}, "greydns.io/ttl"},
+		{"ttl_all_zeros", map[string]string{"greydns.io/ttl": "000"}, "greydns.io/ttl"},
 		{"ttl_negative", map[string]string{"greydns.io/ttl": "-5"}, "greydns.io/ttl"},
 		{"ttl_float", map[string]string{"greydns.io/ttl": "1.5"}, "greydns.io/ttl"},
 		{"ttl_nonnumeric", map[string]string{"greydns.io/ttl": "abc"}, "greydns.io/ttl"},

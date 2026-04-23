@@ -162,7 +162,7 @@ GreyDNS will create an event on the service if it detects a record that is alrea
 
 ### Admission-time annotation validation (optional)
 
-`admission-policy.yaml` ships a `ValidatingAdmissionPolicy` that rejects malformed `greydns.io/*` annotations at `kubectl apply` time, so typos surface immediately instead of landing as `InvalidAnnotation` events at reconcile. It's optional and independent of the controller; apply it alongside the deployment if you want upfront feedback:
+`admission-policy.yaml` ships a `ValidatingAdmissionPolicy` that rejects malformed values on the core `greydns.io/*` annotations (`dns`, `zone`, `domain`, `ttl`, `record-type`) at `kubectl apply` time, so typos surface immediately instead of landing as `InvalidAnnotation` events at reconcile. Provider-scoped keys like `greydns.io/cloudflare-proxied` are passed through untouched. It's optional and independent of the controller; apply it alongside the deployment if you want upfront feedback:
 
 ```bash
 kubectl apply -f admission-policy.yaml
