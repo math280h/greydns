@@ -13,6 +13,10 @@ import (
 
 const CallTimeout = 30 * time.Second
 
+func WithCallTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, CallTimeout)
+}
+
 type RecordType string
 
 const (

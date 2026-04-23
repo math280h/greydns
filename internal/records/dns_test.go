@@ -1351,3 +1351,62 @@ func TestHandleUpdates_ContestedNewDomainPreservesOldRecords(t *testing.T) {
 		t.Fatalf("a.example.com should be preserved when rename target is contested, got %v", names)
 	}
 }
+
+type deadlineWatcher struct {
+	dnsprovider.Provider
+	createHadDeadline bool
+	updateHadDeadline bool
+	deleteHadDeadline bool
+}
+
+func (d *deadlineWatcher) CreateRecord(ctx context.Context, rec dnsprovider.Record) (dnsprovider.Record, error) {
+	_, d.createHadDeadline = ctx.Deadline()
+	return d.Provider.CreateRecord(ctx, rec)
+}
+
+func (d *deadlineWatcher) UpdateRecord(ctx context.Context, rec dnsprovider.Record) (dnsprovider.Record, error) {
+	_, d.updateHadDeadline = ctx.Deadline()
+	return d.Provider.UpdateRecord(ctx, rec)
+}
+
+func (d *deadlineWatcher) DeleteRecord(ctx context.Context, zoneID, id string) error {
+	_, d.deleteHadDeadline = ctx.Deadline()
+	return d.Provider.DeleteRecord(ctx, zoneID, id)
+}
+
+func TestReconciler_AppliesCallTimeoutToProviderOps(t *testing.T) {
+	watcher := &deadlineWatcher{Provider: fake.New(dnsprovider.Zone{ID: testZoneID, Name: testZoneName})}
+	stubRecorder(t)
+	r := records.NewReconciler(
+		watcher,
+		map[string]string{testZoneName: testZoneID},
+		records.Snapshot{
+			RecordTTL:          60,
+			RecordType:         dnsprovider.RecordTypeA,
+			IngressDestination: testIngress,
+			OverridePolicy:     records.NewOverridePolicy("", false),
+		},
+	)
+
+	s := svc(dnsAnnotations(testZoneName, testDomain))
+	mustReconcile(t, r, s)
+	if !watcher.createHadDeadline {
+		t.Fatal("CreateRecord ctx should carry a deadline from WithCallTimeout")
+	}
+
+	r.UpdateSnapshot(records.Snapshot{
+		RecordTTL:          900,
+		RecordType:         dnsprovider.RecordTypeA,
+		IngressDestination: testIngress,
+		OverridePolicy:     records.NewOverridePolicy("", false),
+	})
+	mustReconcile(t, r, s)
+	if !watcher.updateHadDeadline {
+		t.Fatal("UpdateRecord ctx should carry a deadline from WithCallTimeout")
+	}
+
+	mustCleanup(t, r, s)
+	if !watcher.deleteHadDeadline {
+		t.Fatal("DeleteRecord ctx should carry a deadline from WithCallTimeout")
+	}
+}

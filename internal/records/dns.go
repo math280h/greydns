@@ -774,7 +774,7 @@ func (r *Reconciler) deleteRecordOrRetry(ctx context.Context, serviceName string
 func (r *Reconciler) callProviderCreate(ctx context.Context, rec dnsprovider.Record) (dnsprovider.Record, error) {
 	var err error
 	defer metrics.ObserveProviderCall(r.provider.Name(), metrics.OpCreate)(&err)
-	callCtx, cancel := context.WithTimeout(ctx, dnsprovider.CallTimeout)
+	callCtx, cancel := dnsprovider.WithCallTimeout(ctx)
 	defer cancel()
 	out, err := r.provider.CreateRecord(callCtx, rec)
 	return out, err
@@ -783,7 +783,7 @@ func (r *Reconciler) callProviderCreate(ctx context.Context, rec dnsprovider.Rec
 func (r *Reconciler) callProviderUpdate(ctx context.Context, rec dnsprovider.Record) (dnsprovider.Record, error) {
 	var err error
 	defer metrics.ObserveProviderCall(r.provider.Name(), metrics.OpUpdate)(&err)
-	callCtx, cancel := context.WithTimeout(ctx, dnsprovider.CallTimeout)
+	callCtx, cancel := dnsprovider.WithCallTimeout(ctx)
 	defer cancel()
 	out, err := r.provider.UpdateRecord(callCtx, rec)
 	return out, err
@@ -792,7 +792,7 @@ func (r *Reconciler) callProviderUpdate(ctx context.Context, rec dnsprovider.Rec
 func (r *Reconciler) callProviderDelete(ctx context.Context, zoneID, id string) error {
 	var err error
 	defer metrics.ObserveProviderCall(r.provider.Name(), metrics.OpDelete)(&err)
-	callCtx, cancel := context.WithTimeout(ctx, dnsprovider.CallTimeout)
+	callCtx, cancel := dnsprovider.WithCallTimeout(ctx)
 	defer cancel()
 	err = r.provider.DeleteRecord(callCtx, zoneID, id)
 	return err
