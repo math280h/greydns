@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 )
+
+const CallTimeout = 30 * time.Second
 
 type RecordType string
 

@@ -344,13 +344,17 @@ func listOwnedRecords(
 ) ([]dnsprovider.Record, error) {
 	var err error
 	defer metrics.ObserveProviderCall(provider.Name(), metrics.OpListOwned)(&err)
-	out, err := provider.ListOwnedRecords(ctx, zoneID)
+	callCtx, cancel := context.WithTimeout(ctx, dnsprovider.CallTimeout)
+	defer cancel()
+	out, err := provider.ListOwnedRecords(callCtx, zoneID)
 	return out, err
 }
 
 func listZones(ctx context.Context, provider dnsprovider.Provider) ([]dnsprovider.Zone, error) {
 	var err error
 	defer metrics.ObserveProviderCall(provider.Name(), metrics.OpListZones)(&err)
-	out, err := provider.ListZones(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, dnsprovider.CallTimeout)
+	defer cancel()
+	out, err := provider.ListZones(callCtx)
 	return out, err
 }
