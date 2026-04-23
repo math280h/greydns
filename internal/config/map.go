@@ -51,10 +51,11 @@ func Data() map[string]string {
 
 func LoadConfigMap(
 	clientset *kubernetes.Clientset,
+	namespace string,
 ) {
 	var err error
 	ConfigMap, err = clientset.CoreV1().ConfigMaps(
-		"default",
+		namespace,
 	).Get(context.Background(), "greydns-config", metav1.GetOptions{})
 	if err != nil {
 		log.Fatal().Err(err).Msg("[Config] Failed to get configmap")

@@ -52,9 +52,10 @@ func Watch(
 			if !ok || cm.Name != name {
 				return
 			}
-			previous = cloneData(cm.Data)
+			snapshot := cloneData(cm.Data)
+			previous = snapshot
 			log.Info().Str("configmap", name).Msg("[Config] Initial ConfigMap loaded")
-			onChange(cm.Data)
+			onChange(snapshot)
 		},
 		UpdateFunc: func(_, newObj any) {
 			cm, ok := newObj.(*v1.ConfigMap)
@@ -64,9 +65,10 @@ func Watch(
 			if reflect.DeepEqual(previous, cm.Data) {
 				return
 			}
-			previous = cloneData(cm.Data)
+			snapshot := cloneData(cm.Data)
+			previous = snapshot
 			log.Info().Str("configmap", name).Msg("[Config] ConfigMap changed; applying")
-			onChange(cm.Data)
+			onChange(snapshot)
 		},
 	}
 	if _, err := informer.AddEventHandler(handler); err != nil {

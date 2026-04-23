@@ -109,10 +109,13 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["greydns-config"]
-    # list/watch are authorized by resourceNames only when the request
-    # includes a matching metadata.name field selector (our informer
-    # does). This keeps the permission pinned to the single object.
-    verbs: ["get", "list", "watch"]
+    verbs: ["get"]
+  # list/watch cannot be scoped by resourceNames in RBAC, so they
+  # apply to every ConfigMap in the namespace. The informer itself
+  # restricts its cache to greydns-config via a FieldSelector.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["list", "watch"]
   - apiGroups: [""]
     resources: ["secrets"]
     resourceNames: ["greydns-secret"]

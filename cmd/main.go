@@ -73,8 +73,9 @@ func run() error {
 		return fmt.Errorf("create clientset: %w", err)
 	}
 
-	cfg.LoadConfigMap(clientset)
-	secret, err := clientset.CoreV1().Secrets("default").Get(ctx, "greydns-secret", metav1.GetOptions{})
+	namespace := namespaceFromEnv()
+	cfg.LoadConfigMap(clientset, namespace)
+	secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, "greydns-secret", metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get greydns-secret: %w", err)
 	}
@@ -91,15 +92,14 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("resolve pod identity: %w", err)
 	}
-	leaseNamespace := namespaceFromEnv()
 
 	leaderErr := leader.Run(ctx, leader.Config{
 		Clientset: clientset,
-		Namespace: leaseNamespace,
+		Namespace: namespace,
 		LeaseName: leader.DefaultLeaseName,
 		Identity:  identity,
 		OnBecome: func(leaderCtx context.Context) {
-			if runErr := runAsLeader(leaderCtx, clientset, secret.Data); runErr != nil {
+			if runErr := runAsLeader(leaderCtx, clientset, namespace, secret.Data); runErr != nil {
 				log.Error().Err(runErr).Msg("[Core] Leader run exited with error")
 			}
 		},
@@ -121,7 +121,12 @@ func run() error {
 // controller plus refresh loop until leaderCtx cancels (leadership lost
 // or shutdown). Called from leader.Run's OnBecome so only one pod at a
 // time mutates DNS.
-func runAsLeader(leaderCtx context.Context, clientset kubernetes.Interface, secretData map[string][]byte) error {
+func runAsLeader(
+	leaderCtx context.Context,
+	clientset kubernetes.Interface,
+	namespace string,
+	secretData map[string][]byte,
+) error {
 	provider := mustBuildProvider(secretData)
 	refreshInterval := mustRefreshInterval()
 
@@ -152,7 +157,7 @@ func runAsLeader(leaderCtx context.Context, clientset kubernetes.Interface, secr
 	}()
 	go func() {
 		defer wg.Done()
-		runConfigWatcher(leaderCtx, clientset, provider, reconciler, ctrl.ResyncAll)
+		runConfigWatcher(leaderCtx, clientset, namespace, provider, reconciler, ctrl.ResyncAll)
 	}()
 
 	<-leaderCtx.Done()
@@ -168,12 +173,13 @@ func runAsLeader(leaderCtx context.Context, clientset kubernetes.Interface, secr
 func runConfigWatcher(
 	ctx context.Context,
 	clientset kubernetes.Interface,
+	namespace string,
 	provider dnsprovider.Provider,
 	reconciler *records.Reconciler,
 	resync func() error,
 ) {
 	initialApplied := false
-	err := cfg.Watch(ctx, clientset, namespaceFromEnv(), "greydns-config", func(data map[string]string) {
+	err := cfg.Watch(ctx, clientset, namespace, "greydns-config", func(data map[string]string) {
 		next, parseErr := records.ParseSnapshot(data, provider)
 		if parseErr != nil {
 			log.Error().Err(parseErr).Msg("[Config] Rejecting invalid ConfigMap update; keeping previous snapshot")
